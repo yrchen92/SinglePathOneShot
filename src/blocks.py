@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 
-
 class Shufflenet(nn.Module):
 
     def __init__(self, inp, oup, mid_channels, *, ksize, stride):
@@ -120,6 +119,20 @@ class Shuffle_Xception(nn.Module):
             x = old_x
             return torch.cat((self.branch_proj(x_proj), self.branch_main(x)), 1)
 
+
+class SimConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernal_size):
+        super(SimConv, self).__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernal_size, 1, bias=True,
+                          padding=(kernal_size - 1) // 2)
+        self.relu = nn.ReLU()
+
+    def forward(self, inputs):
+        inputs = torch.transpose(inputs, 1, 2)  # to (N, C, L)
+        inputs = self.conv(inputs)
+        inputs = self.relu(inputs)
+        inputs = torch.transpose(inputs, 1, 2)  # to (N, L, C)
+        return inputs
 
 def channel_shuffle(x):
     batchsize, num_channels, height, width = x.data.size()

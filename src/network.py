@@ -1,25 +1,30 @@
 import torch
 import torch.nn as nn
-from blocks import Shufflenet, Shuffle_Xception
+from blocks import Shufflenet, Shuffle_Xception, SimConv
 
 
 class ShuffleNetV2_OneShot(nn.Module):
 
-    def __init__(self, input_size=224, n_class=1000):
+    def __init__(self, n_vocab, input_size=128, n_class=1000, emb_w=None):
         super(ShuffleNetV2_OneShot, self).__init__()
+        self.input_size = input_size
 
-        assert input_size % 32 == 0
-
-        self.stage_repeats = [4, 4, 8, 4]
+        self.stage_repeats = [4]
         self.stage_out_channels = [-1, 16, 64, 160, 320, 640, 1024]
 
         # building first layer
         input_channel = self.stage_out_channels[1]
-        self.first_conv = nn.Sequential(
-            nn.Conv2d(3, input_channel, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(input_channel, affine=False),
-            nn.ReLU(inplace=True),
-        )
+
+        if emb_w is None:
+            self.embedding =  nn.Sequential(
+                torch.nn.Embedding(n_vocab, input_size, padding_idx=None,
+                    max_norm=None, norm_type=2.0, scale_grad_by_freq=False, 
+                    sparse=False, _weight=None),
+                torch.nn.Linear(input_size, input_size))
+        else:
+            self.embedding =  nn.Sequential(
+                torch.nn.Embedding.from_pretrained(emb_w, freeze=False),
+                torch.nn.Linear(emb_w.size(-1), input_size))
 
         self.features = torch.nn.ModuleList()
         archIndex = 0
@@ -28,74 +33,65 @@ class ShuffleNetV2_OneShot(nn.Module):
             output_channel = self.stage_out_channels[idxstage + 2]
 
             for i in range(numrepeat):
-                if i == 0:
-                    inp, outp, stride = input_channel, output_channel, 2
-                else:
-                    inp, outp, stride = input_channel // 2, output_channel, 1
-
-                base_mid_channels = outp // 2
-                mid_channels = int(base_mid_channels)
                 archIndex += 1
                 self.features.append(torch.nn.ModuleList())
                 for blockIndex in range(4):
                     if blockIndex == 0:
-                        print('Shuffle3x3')
-                        self.features[-1].append(
-                            Shufflenet(inp, outp, mid_channels=mid_channels, ksize=3, stride=stride))
+                        # print('Conv1')
+                        self.features[-1].append(SimConv(input_size, input_size, 3))
                     elif blockIndex == 1:
-                        print('Shuffle5x5')
-                        self.features[-1].append(
-                            Shufflenet(inp, outp, mid_channels=mid_channels, ksize=5, stride=stride))
+                        # print('Conv3')
+                        self.features[-1].append(SimConv(input_size, input_size, 3))
                     elif blockIndex == 2:
-                        print('Shuffle7x7')
-                        self.features[-1].append(
-                            Shufflenet(inp, outp, mid_channels=mid_channels, ksize=7, stride=stride))
+                        # print('Conv5')
+                        self.features[-1].append(SimConv(input_size, input_size, 5))
                     elif blockIndex == 3:
-                        print('Xception')
-                        self.features[-1].append(
-                            Shuffle_Xception(inp, outp, mid_channels=mid_channels, stride=stride))
+                        # print('Conv7')
+                        self.features[-1].append(SimConv(input_size, input_size, 7))
                     else:
                         raise NotImplementedError
-                input_channel = output_channel
 
         self.archLen = archIndex
         # self.features = nn.Sequential(*self.features)
-
-        self.conv_last = nn.Sequential(
-            nn.Conv2d(
-                input_channel, self.stage_out_channels[
-                    -1], 1, 1, 0, bias=False),
-            nn.BatchNorm2d(self.stage_out_channels[-1], affine=False),
-            nn.ReLU(inplace=True),
-        )
-        self.globalpool = nn.AvgPool2d(7)
-        self.dropout = nn.Dropout(0.1)
         self.classifier = nn.Sequential(
-            nn.Linear(self.stage_out_channels[-1], n_class, bias=False))
+            nn.Linear(input_size, n_class, bias=False))
         self._initialize_weights()
 
-    def forward(self, x, architecture):
-        assert self.archLen == len(architecture)
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
+                position_ids=None, head_mask=None, architecture=None):
 
-        x = self.first_conv(x)
+        len_input = torch.sum(attention_mask, dim=-1)
+        len_input_max = torch.max(len_input).item()
+        input_ids = input_ids[:,:len_input_max]
+        token_type_ids = token_type_ids[:,:len_input_max]
+        attention_mask = attention_mask[:,:len_input_max]
+
+        assert self.archLen == len(architecture)
+        x = input_ids
+
+        x = self.embedding(x)
 
         for archs, arch_id in zip(self.features, architecture):
             x = archs[arch_id](x)
 
-        x = self.conv_last(x)
-
-        x = self.globalpool(x)
-
-        x = self.dropout(x)
-        x = x.contiguous().view(-1, self.stage_out_channels[-1])
+        x = self.global_max_pool(x, attention_mask)
+        # x = x.view(-1, self.input_size)
         x = self.classifier(x)
+        return x
+
+    def global_max_pool(self, x, mask):
+        # mask = torch.eq(mask.float(), 0.0).long()
+        # mask = torch.unsqueeze(mask, dim=2).repeat(1, 1, x.size(2))
+        # mask *= -(2 ** 8)
+        # x += mask
+        x = torch.max(x, dim=1)[0]
         return x
 
     def _initialize_weights(self):
         for name, m in self.named_modules():
-            if isinstance(m, nn.Conv2d):
+            if isinstance(m, nn.Conv1d):
                 if 'first' in name:
-                    nn.init.normal_(m.weight, 0, 0.01)
+                    nn.init.normal_(m.weight, 0, 0.001)
                 else:
                     nn.init.normal_(m.weight, 0, 1.0 / m.weight.shape[1])
                 if m.bias is not None:
