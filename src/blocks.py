@@ -121,18 +121,51 @@ class Shuffle_Xception(nn.Module):
 
 
 class SimConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernal_size):
+    def __init__(self, in_channels, out_channels, kernal_size, dilation=1):
         super(SimConv, self).__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernal_size, 1, bias=True,
-                          padding=(kernal_size - 1) // 2)
         self.relu = nn.ReLU()
-
+        self.conv = nn.Conv1d(in_channels, out_channels, kernal_size, 1, bias=True,
+                          padding= dilation * (kernal_size - 1) // 2, dilation=dilation)
+        self.bn = nn.BatchNorm1d(out_channels, affine=False)
+        
     def forward(self, inputs):
         inputs = torch.transpose(inputs, 1, 2)  # to (N, C, L)
-        inputs = self.conv(inputs)
         inputs = self.relu(inputs)
+        inputs = self.conv(inputs)
+        inputs = self.bn(inputs)
         inputs = torch.transpose(inputs, 1, 2)  # to (N, L, C)
         return inputs
+
+class SkipOp(nn.Module):
+    def __init__(self):
+        super(SkipOp, self).__init__()
+        
+    def forward(self, inputs):
+        return inputs
+
+class MaxPooling(nn.Module):
+    def __init__(self, kernal_size=3, stride=1):
+        super(MaxPooling, self).__init__()
+        self.maxpooling = nn.MaxPool1d(kernal_size, stride=stride, padding=(kernal_size - 1) // 2)
+        
+    def forward(self, inputs):
+        inputs = torch.transpose(inputs, 1, 2)  # to (N, C, L)
+        inputs = self.maxpooling(inputs)
+        inputs = torch.transpose(inputs, 1, 2)  # to (N, L, C)
+        return inputs
+
+class AvgPooling(nn.Module):
+    def __init__(self, kernal_size=3, stride=1):
+        super(AvgPooling, self).__init__()
+        self.maxpooling = nn.AvgPool1d(kernal_size, stride=stride, padding=(kernal_size - 1) // 2)
+        
+    def forward(self, inputs):
+        inputs = torch.transpose(inputs, 1, 2)  # to (N, C, L)
+        inputs = self.maxpooling(inputs)
+        inputs = torch.transpose(inputs, 1, 2)  # to (N, L, C)
+        return inputs
+
+
 
 def channel_shuffle(x):
     batchsize, num_channels, height, width = x.data.size()

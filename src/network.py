@@ -1,44 +1,39 @@
 import torch
 import torch.nn as nn
-from blocks import Shufflenet, Shuffle_Xception, SimConv
+from blocks import *
 
 
 class ShuffleNetV2_OneShot(nn.Module):
 
-    def __init__(self, n_vocab, input_size=128, n_class=1000, emb_w=None):
+    def __init__(self, n_vocab, input_size=128, n_class=1000, emb=None):
         super(ShuffleNetV2_OneShot, self).__init__()
         self.input_size = input_size
 
-        self.stage_repeats = [4]
-        self.stage_out_channels = [-1, 16, 64, 160, 320, 640, 1024]
+        self.stage_repeats = [6, 6, 6, 6]
 
         # building first layer
-        input_channel = self.stage_out_channels[1]
-
-        if emb_w is None:
-            self.embedding =  nn.Sequential(
-                torch.nn.Embedding(n_vocab, input_size, padding_idx=None,
-                    max_norm=None, norm_type=2.0, scale_grad_by_freq=False, 
-                    sparse=False, _weight=None),
-                torch.nn.Linear(input_size, input_size))
+        if emb is None:
+            self.word_embeddings = nn.Embedding(n_vocab, input_size, padding_idx=0)
+            self.position_embeddings = nn.Embedding(512, input_size)
+            self.token_type_embeddings = nn.Embedding(2, input_size)
+            emb_dim = input_size
         else:
-            self.embedding =  nn.Sequential(
-                torch.nn.Embedding.from_pretrained(emb_w, freeze=False),
-                torch.nn.Linear(emb_w.size(-1), input_size))
-
+            self.word_embeddings = torch.nn.Embedding.from_pretrained(emb[0], freeze=False)
+            self.position_embeddings = torch.nn.Embedding.from_pretrained(emb[1], freeze=False)
+            self.token_type_embeddings = torch.nn.Embedding.from_pretrained(emb[2], freeze=False)
+            emb_dim = emb[0].size(-1)
+        self.embedding_transform = torch.nn.Linear(emb_dim, input_size)
         self.features = torch.nn.ModuleList()
         archIndex = 0
         for idxstage in range(len(self.stage_repeats)):
             numrepeat = self.stage_repeats[idxstage]
-            output_channel = self.stage_out_channels[idxstage + 2]
-
             for i in range(numrepeat):
                 archIndex += 1
                 self.features.append(torch.nn.ModuleList())
-                for blockIndex in range(4):
+                for blockIndex in range(9):
                     if blockIndex == 0:
-                        # print('Conv1')
-                        self.features[-1].append(SimConv(input_size, input_size, 3))
+                        # print('Skip')
+                        self.features[-1].append(SkipOp())
                     elif blockIndex == 1:
                         # print('Conv3')
                         self.features[-1].append(SimConv(input_size, input_size, 3))
@@ -48,6 +43,21 @@ class ShuffleNetV2_OneShot(nn.Module):
                     elif blockIndex == 3:
                         # print('Conv7')
                         self.features[-1].append(SimConv(input_size, input_size, 7))
+                    elif blockIndex == 4:
+                        # print('Conv3')
+                        self.features[-1].append(SimConv(input_size, input_size, 3, dilation=2))
+                    elif blockIndex == 5:
+                        # print('Conv5')
+                        self.features[-1].append(SimConv(input_size, input_size, 5, dilation=2))
+                    elif blockIndex == 6:
+                        # print('Conv7')
+                        self.features[-1].append(SimConv(input_size, input_size, 7, dilation=2))
+                    elif blockIndex == 7:
+                        # print('Conv7')
+                        self.features[-1].append(MaxPooling())
+                    elif blockIndex == 8:
+                        # print('Conv7')
+                        self.features[-1].append(AvgPooling())
                     else:
                         raise NotImplementedError
 
@@ -66,13 +76,20 @@ class ShuffleNetV2_OneShot(nn.Module):
         token_type_ids = token_type_ids[:,:len_input_max]
         attention_mask = attention_mask[:,:len_input_max]
 
-        assert self.archLen == len(architecture)
-        x = input_ids
+        assert self.archLen == len(architecture) * len(self.stage_repeats)
 
-        x = self.embedding(x)
+        if position_ids is None:
+            seq_length = input_ids.size(1)
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+            position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        if token_type_ids is None:
+            token_type_ids = torch.zeros_like(input_ids)
+
+        x = self.word_embeddings(input_ids) + self.position_embeddings(position_ids) + self.token_type_embeddings(token_type_ids)
+        x = self.embedding_transform(x)
 
         for archs, arch_id in zip(self.features, architecture):
-            x = archs[arch_id](x)
+            x = archs[arch_id](x) + x
 
         x = self.global_max_pool(x, attention_mask)
         # x = x.view(-1, self.input_size)
@@ -96,14 +113,9 @@ class ShuffleNetV2_OneShot(nn.Module):
                     nn.init.normal_(m.weight, 0, 1.0 / m.weight.shape[1])
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, nn.BatchNorm1d):
                 if m.weight is not None:
                     nn.init.constant_(m.weight, 1)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0001)
-                nn.init.constant_(m.running_mean, 0)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0001)
                 nn.init.constant_(m.running_mean, 0)

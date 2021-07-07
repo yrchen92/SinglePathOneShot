@@ -980,7 +980,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         self.apply(self.init_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
-                position_ids=None, head_mask=None):        
+                position_ids=None, head_mask=None, architecture=None):        
         len_input = torch.sum(attention_mask, dim=-1)
         len_input_max = torch.max(len_input).item()
         input_ids = input_ids[:,:len_input_max]

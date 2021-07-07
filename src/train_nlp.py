@@ -33,6 +33,8 @@ from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
 
 logger = logging.getLogger(__name__)
 
+
+
 ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig, XLNetConfig, XLMConfig, RobertaConfig)), ())
 
 MODEL_CLASSES = {
@@ -45,7 +47,20 @@ MODEL_CLASSES = {
 def fix_parameters(model):
     for name, param in model.named_parameters():
 	    param.requires_grad = False
-        
+
+get_random_cand = lambda:tuple(np.random.randint(9) for i in range(6))
+def get_uniform_sample_cand(*,timeout=500):
+    return get_random_cand()
+    flops_l, flops_r, flops_step = 290, 360, 10
+    bins = [[i, i+flops_step] for i in range(flops_l, flops_r, flops_step)]
+    idx = np.random.randint(len(bins))
+    l, r = bins[idx]
+    for i in range(timeout):
+        cand = get_random_cand()
+        if l*1e6 <= get_cand_flops(cand) <= r*1e6:
+            return cand
+    return get_random_cand()
+
 class DataIterator(object):
 
     def __init__(self, dataloader):
@@ -235,10 +250,11 @@ def main():
                         # level = logging.INFO)
     t = time.time()
     local_time = time.localtime(t)
-    if not os.path.exists('./log'):
-        os.mkdir('./log')
+    log_dir = os.path.join(args.output_dir, 'log')
+    if not os.path.exists(log_dir):
+        os.mkdir(log_dir)
     log_format = '[%(asctime)s] %(message)s'
-    fh = logging.FileHandler(os.path.join('log/train_{}_r{}{:02}{}'.format(args.local_rank, local_time.tm_year % 2000, local_time.tm_mon, t)))
+    fh = logging.FileHandler(os.path.join('{}/train_{}_r{}{:02}{}'.format(log_dir, args.local_rank, local_time.tm_year % 2000, local_time.tm_mon, t)))
     fh.setFormatter(logging.Formatter(log_format))
     logging.getLogger().addHandler(fh)
 
@@ -370,7 +386,7 @@ def main():
 
     all_iters = 0
     if args.auto_continue:
-        lastest_model, iters = get_lastest_model()
+        lastest_model, iters = get_lastest_model(args)
         if lastest_model is not None:
             if args.local_rank in [-1, 0]:
                 logger.info('load from checkpoint {}'.format(lastest_model))
@@ -406,15 +422,15 @@ def main():
     args.eval_dataloader = eval_dataloader
 
     if args.eval:
-        if args.eval_resume is not None:
-            checkpoint = torch.load(args.eval_resume, map_location=None if not args.no_cuda else 'cpu')
-            model.load_state_dict(checkpoint, strict=True)
-            validate(model, device, args, all_iters=all_iters)
+        # if args.eval_resume is not None:
+        #     checkpoint = torch.load(args.eval_resume, map_location=None if not args.no_cuda else 'cpu')
+        #     model.load_state_dict(checkpoint, strict=True)
+        validate(t_model, device, args, all_iters=all_iters, eval_num=1)    
         exit(0)
 
     while all_iters < args.total_iters:
         all_iters = train(model, device, args, val_interval=args.val_interval, bn_process=False, all_iters=all_iters, t_model=t_model)
-        validate(model, device, args, all_iters=all_iters)
+        validate(model, device, args, all_iters=all_iters, eval_num=10)
 
     # all_iters = train(model, device, args, val_interval=int(1280000/args.batch_size), bn_process=True, all_iters=all_iters)
     # save_checkpoint({'state_dict': model.state_dict(),}, args.total_iters, tag='bnps-')
@@ -450,18 +466,7 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
                   'labels':         batch[3]}
 
         data_time = time.time() - d_st
-        get_random_cand = lambda:tuple(np.random.randint(4) for i in range(4))
-        flops_l, flops_r, flops_step = 290, 360, 10
-        bins = [[i, i+flops_step] for i in range(flops_l, flops_r, flops_step)]
-
-        def get_uniform_sample_cand(*,timeout=500):
-            idx = np.random.randint(len(bins))
-            l, r = bins[idx]
-            for i in range(timeout):
-                cand = get_random_cand()
-                if l*1e6 <= get_cand_flops(cand) <= r*1e6:
-                    return cand
-            return get_random_cand()
+        # get_random_cand = lambda:tuple(np.random.randint(4) for i in range(4))
         
         t_outputs = t_model(**inputs)
         inputs['architecture'] = get_uniform_sample_cand()
@@ -512,62 +517,66 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
             t1 = time.time()
 
         if all_iters % args.save_interval == 0:
-            save_checkpoint({'state_dict': model.state_dict(),}, all_iters)
+            save_checkpoint(args, {'state_dict': model.state_dict(),}, all_iters)
 
     return all_iters
 
-def validate(model, device, args, *, all_iters=None):
+def validate(model, device, args, *, all_iters=None, eval_num=1):
     loss_function = args.loss_function
     eval_dataprovider = args.eval_dataprovider
     model.eval()
     max_val_iters = 250
     t1  = time.time()
+    for _ in range(eval_num):
+        preds = None
+        labels = None
+        eval_loss = 0
+        eval_num = 0
+        results = {}
+        with torch.no_grad():
+            # for _ in range(1, max_val_iters + 1):
+            for batch in args.eval_dataloader:
+                batch = eval_dataprovider.next()
+                batch = tuple(t.to(args.device) for t in batch)
+                inputs = {'input_ids':      batch[0],
+                        'attention_mask': batch[1],
+                        'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] \
+                                                        and not args.no_segment else None,
+                        'labels':         batch[3]}
+                
+                # get_random_cand = lambda:tuple(np.random.randint(4) for i in range(4))
+                inputs['architecture'] = get_random_cand()
+                output = model(**inputs)
 
-    preds = None
-    labels = None
-    eval_loss = 0
-    eval_num = 0
-    results = {}
-    with torch.no_grad():
-        # for _ in range(1, max_val_iters + 1):
-        for batch in args.eval_dataloader:
-            batch = eval_dataprovider.next()
-            batch = tuple(t.to(args.device) for t in batch)
-            inputs = {'input_ids':      batch[0],
-                    'attention_mask': batch[1],
-                    'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] \
-                                                    and not args.no_segment else None,
-                    'labels':         batch[3]}
-            
-            get_random_cand = lambda:tuple(np.random.randint(4) for i in range(4))
-            inputs['architecture'] = get_random_cand()
-            output = model(**inputs)
+                if isinstance(output, tuple):
+                    output = output[1]
 
-            eval_num += inputs['input_ids'].size(0)
-            loss = loss_function(output, inputs['labels'])
-            eval_loss += loss.item()
-            
-            if preds is None:
-                preds = output.detach().cpu().numpy()
-                labels = inputs['labels'].detach().cpu().numpy()
-            else:
-                preds = np.append(preds, output.detach().cpu().numpy(), axis=0)
-                labels = np.append(labels, inputs['labels'].detach().cpu().numpy(), axis=0)
+                eval_num += inputs['input_ids'].size(0)
+                loss = loss_function(output, inputs['labels'])
+                eval_loss += loss.item()
+                
+                if preds is None:
+                    preds = output.detach().cpu().numpy()
+                    labels = inputs['labels'].detach().cpu().numpy()
+                else:
+                    preds = np.append(preds, output.detach().cpu().numpy(), axis=0)
+                    labels = np.append(labels, inputs['labels'].detach().cpu().numpy(), axis=0)
 
-    eval_loss = eval_loss / eval_num
-    if args.output_mode == "classification":
-        preds = np.argmax(preds, axis=1)
-    elif args.output_mode == "regression":
-        preds = np.squeeze(preds)
-    result = compute_metrics(args.task_name, preds, labels)
-    result['eval_loss'] = eval_loss
-    results.update(result)
-    if args.local_rank in [-1, 0]:
-        logger.info("***** Eval {} results *****".format(args.task_name))
-        log_info = 'Iter {}:'.format(all_iters)
-        for key in sorted(result.keys()):
-            log_info += '\teavl_{} = {:.6f}'.format(key, result[key])
-    logger.info(log_info)
+        eval_loss = eval_loss / eval_num
+        if args.output_mode == "classification":
+            preds = np.argmax(preds, axis=1)
+        elif args.output_mode == "regression":
+            preds = np.squeeze(preds)
+        result = compute_metrics(args.task_name, preds, labels)
+        result['eval_loss'] = eval_loss
+        results.update(result)
+        if args.local_rank in [-1, 0]:
+            logger.info("***** Eval {} results *****".format(args.task_name))
+            log_info = 'Iter {}:'.format(all_iters)
+            for key in sorted(result.keys()):
+                log_info += '\teavl_{} = {:.6f}'.format(key, result[key])
+            log_info += '\n{}'.format(str(inputs['architecture']))
+        logger.info(log_info)
 
 if __name__ == "__main__":
     main()

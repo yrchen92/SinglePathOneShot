@@ -488,6 +488,8 @@ class PreTrainedModel(nn.Module):
         new_keys = []
         for key in state_dict.keys():
             new_key = None
+            if 'seq_cls.classifier' in key:
+                new_key = key.replace('seq_cls.classifier', 'classifier')
             if 'gamma' in key:
                 new_key = key.replace('gamma', 'weight')
             if 'beta' in key:

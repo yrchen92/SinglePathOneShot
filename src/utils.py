@@ -55,27 +55,29 @@ def accuracy(output, target, topk=(1,)):
     return res
 
 
-def save_checkpoint(state, iters, tag=''):
-    if not os.path.exists("./models"):
-        os.makedirs("./models")
+def save_checkpoint(args, state, iters, tag=''):
+    output_dir = os.path.join(args.output_dir, 'models')
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     filename = os.path.join(
-        "./models/{}checkpoint-{:06}.pth.tar".format(tag, iters))
+        "{}/{}checkpoint-{:06}.pth.tar".format(output_dir, tag, iters))
     torch.save(state, filename)
     latestfilename = os.path.join(
-        "./models/{}checkpoint-latest.pth.tar".format(tag))
+        "{}/{}checkpoint-latest.pth.tar".format(output_dir, tag))
     torch.save(state, latestfilename)
 
 
-def get_lastest_model():
-    if not os.path.exists('./models'):
-        os.mkdir('./models')
-    model_list = os.listdir('./models/')
+def get_lastest_model(args):
+    output_dir = os.path.join(args.output_dir, 'models')
+    if not os.path.exists(output_dir):
+        os.mkdir(output_dir)
+    model_list = os.listdir(output_dir)
     if model_list == []:
         return None, 0
     model_list.sort()
-    lastest_model = model_list[-1]
+    lastest_model = model_list[-2]
     iters = re.findall(r'\d+', lastest_model)
-    return './models/' + lastest_model, int(iters[0])
+    return output_dir + '/' + lastest_model, int(iters[0])
 
 
 def get_parameters(model):
