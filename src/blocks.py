@@ -126,7 +126,7 @@ class SimConv(nn.Module):
         self.relu = nn.ReLU()
         self.conv = nn.Conv1d(in_channels, out_channels, kernal_size, 1, bias=True,
                           padding= dilation * (kernal_size - 1) // 2, dilation=dilation)
-        self.bn = nn.BatchNorm1d(out_channels, affine=False)
+        self.bn = nn.BatchNorm1d(out_channels, affine=True)
         
     def forward(self, inputs):
         inputs = torch.transpose(inputs, 1, 2)  # to (N, C, L)
@@ -139,17 +139,28 @@ class SimConv(nn.Module):
 class SkipOp(nn.Module):
     def __init__(self):
         super(SkipOp, self).__init__()
+        self.relu = nn.ReLU()
         
     def forward(self, inputs):
+        inputs = self.relu(inputs)
         return inputs
+
+class ZeroOp(nn.Module):
+    def __init__(self):
+        super(SkipOp, self).__init__()
+        
+    def forward(self, inputs):
+        return torch.zeros_like(inputs)
 
 class MaxPooling(nn.Module):
     def __init__(self, kernal_size=3, stride=1):
         super(MaxPooling, self).__init__()
+        self.relu = nn.ReLU()
         self.maxpooling = nn.MaxPool1d(kernal_size, stride=stride, padding=(kernal_size - 1) // 2)
         
     def forward(self, inputs):
         inputs = torch.transpose(inputs, 1, 2)  # to (N, C, L)
+        inputs = self.relu(inputs)
         inputs = self.maxpooling(inputs)
         inputs = torch.transpose(inputs, 1, 2)  # to (N, L, C)
         return inputs
@@ -157,10 +168,12 @@ class MaxPooling(nn.Module):
 class AvgPooling(nn.Module):
     def __init__(self, kernal_size=3, stride=1):
         super(AvgPooling, self).__init__()
+        self.relu = nn.ReLU()
         self.maxpooling = nn.AvgPool1d(kernal_size, stride=stride, padding=(kernal_size - 1) // 2)
         
     def forward(self, inputs):
         inputs = torch.transpose(inputs, 1, 2)  # to (N, C, L)
+        inputs = self.relu(inputs)
         inputs = self.maxpooling(inputs)
         inputs = torch.transpose(inputs, 1, 2)  # to (N, L, C)
         return inputs

@@ -60,7 +60,6 @@ class WarmupLinearSchedule(LambdaLR):
             return float(step) / float(max(1, self.warmup_steps))
         return max(0.0, float(self.t_total - step) / float(max(1.0, self.t_total - self.warmup_steps)))
 
-
 class WarmupCosineSchedule(LambdaLR):
     """ Linear warmup and then cosine decay.
         Linearly increases learning rate from 0 to 1 over `warmup_steps` training steps.

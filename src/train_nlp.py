@@ -1,5 +1,7 @@
 import os
 import sys
+from sklearn.decomposition import PCA
+from numpy.core.fromnumeric import mean
 import torch
 import argparse
 import random
@@ -135,7 +137,7 @@ def get_args():
     parser.add_argument('--total_iters', type=int, default=150000, help='total iters')
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
     parser.add_argument('--output_dir', type=str, default='./outputs', help='path for saving trained models')
-    parser.add_argument('--label_smooth', type=float, default=0.1, help='label smoothing')
+    parser.add_argument('--alpha_kd', type=float, default=0.0, help='label smoothing')
 
     # hyper-parameter search
     parser.add_argument("--local_rank", type=int, default=-1,
@@ -330,11 +332,21 @@ def main():
         eval_sampler_mm = SequentialSampler(eval_dataset_mm)
         eval_dataloader_mm = DataLoader(eval_dataset_mm, sampler=eval_sampler_mm, batch_size=args.eval_batch_size)
     
-    emb_w = t_model.bert.embeddings.word_embeddings.weight.clone().detach()
-    model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, emb_w)
+    emb_w = t_model.bert.embeddings.word_embeddings.weight.clone().detach().cpu().numpy()
+    emb_p = t_model.bert.embeddings.position_embeddings.weight.clone().detach().cpu().numpy()
+    emb_t = t_model.bert.embeddings.token_type_embeddings.weight.clone().detach().cpu().numpy()
+    pca = PCA(n_components=args.hidden_size)
+    new_emb_w = pca.fit_transform(emb_w)
+    new_emb_w = torch.from_numpy(new_emb_w)
+
+    # model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, [new_emb_w])
+    # model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, [emb_w, emb_p, emb_t])
+    model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels)
     model.to(args.device)
 
     if args.local_rank in [-1, 0]:
+        logger.info(model)
+        logger.info(args)
         # Train!
         logger.info("***** Running training *****")
         logger.info("  Num examples = %d", len(train_dataset))
@@ -390,14 +402,17 @@ def main():
         if lastest_model is not None:
             if args.local_rank in [-1, 0]:
                 logger.info('load from checkpoint {}'.format(lastest_model))
-            all_iters = iters
             checkpoint = torch.load(lastest_model, map_location=None if not args.no_cuda else 'cpu')
             from collections import OrderedDict
             new_state_dict = OrderedDict()
             for k, v in checkpoint['state_dict'].items():
-                name = k[7:] 
+                if 'module.' in k:
+                    name = k[7:]
+                else:
+                    name = k
                 new_state_dict[name] = v
             model.load_state_dict(new_state_dict, strict=True)
+            all_iters = iters
             for i in range(iters):
                 scheduler.step()
 
@@ -425,7 +440,7 @@ def main():
         # if args.eval_resume is not None:
         #     checkpoint = torch.load(args.eval_resume, map_location=None if not args.no_cuda else 'cpu')
         #     model.load_state_dict(checkpoint, strict=True)
-        validate(t_model, device, args, all_iters=all_iters, eval_num=1)    
+        validate(model, device, args, all_iters=all_iters, eval_num=1000)    
         exit(0)
 
     while all_iters < args.total_iters:
@@ -435,10 +450,10 @@ def main():
     # all_iters = train(model, device, args, val_interval=int(1280000/args.batch_size), bn_process=True, all_iters=all_iters)
     # save_checkpoint({'state_dict': model.state_dict(),}, args.total_iters, tag='bnps-')
 
-def adjust_bn_momentum(model, iters):
-    for m in model.modules():
-        if isinstance(m, nn.BatchNorm2d):
-            m.momentum = 1 / iters
+# def adjust_bn_momentum(model, iters):
+#     for m in model.modules():
+#         if isinstance(m, nn.BatchNorm1d):
+#             m.momentum = 1 / iters
 
 def train(model, device, args, *, val_interval, bn_process=False, all_iters=None, t_model=None):
     optimizer = args.optimizer
@@ -454,8 +469,8 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
     # scheduler.step()
     tr_loss = 0.0
     for iters in range(1, val_interval + 1):
-        if bn_process:
-            adjust_bn_momentum(model, iters)
+        # if bn_process:
+        #     adjust_bn_momentum(model, iters)
         d_st = time.time()
         batch = train_dataprovider.next()
         batch = tuple(t.to(args.device) for t in batch)
@@ -474,7 +489,7 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
         
         r_loss = loss_function(output, inputs['labels'])
         t_loss = cal_logit_loss(output, t_outputs[1].detach())
-        loss = r_loss + t_loss
+        loss = (1 - args.alpha_kd) * r_loss + args.alpha_kd * t_loss
         if args.n_gpu > 1:
             r_loss = r_loss.mean()
             t_loss = t_loss.mean()
@@ -527,6 +542,7 @@ def validate(model, device, args, *, all_iters=None, eval_num=1):
     model.eval()
     max_val_iters = 250
     t1  = time.time()
+    whole_result = []
     for _ in range(eval_num):
         preds = None
         labels = None
@@ -575,8 +591,11 @@ def validate(model, device, args, *, all_iters=None, eval_num=1):
             log_info = 'Iter {}:'.format(all_iters)
             for key in sorted(result.keys()):
                 log_info += '\teavl_{} = {:.6f}'.format(key, result[key])
+                if 'acc' in key or 'corr' in key:
+                    whole_result.append(result[key])
             log_info += '\n{}'.format(str(inputs['architecture']))
         logger.info(log_info)
+    logger.info('best:{}\nworst:{}\naverage:{}'.format(max(whole_result), min(whole_result), sum(whole_result)/len(whole_result)))
 
 if __name__ == "__main__":
     main()
