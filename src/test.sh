@@ -3,7 +3,7 @@ MODEL_DIR=results
 TASK_NAME=MRPC
 CHECKPOINT_DIR=checkpoint/base_bert/${TASK_NAME}
 DATASET_DIR=data/glue_data/${TASK_NAME}
-OUTPUT_DIR=${MODEL_DIR}/${TASK_NAME}_test
+OUTPUT_DIR=${MODEL_DIR}/test
 #export PYTHONPATH="$(pwd)"
 
 # CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch --nproc_per_node 1 train_nlp.py \
@@ -15,7 +15,7 @@ CUDA_VISIBLE_DEVICES=3 python train_nlp.py \
   --do_train \
   --do_eval \
   --do_lower_case \
-  --hidden_size 128 \
+  --hidden_size 256 \
   --max_seq_length 128 \
   --per_gpu_train_batch_size 128 \
   --per_gpu_eval_batch_size 128 \
@@ -26,7 +26,7 @@ CUDA_VISIBLE_DEVICES=3 python train_nlp.py \
   --total_iters 150000 \
   --val_interval 10000 \
   --save_interval 10000 \
-  --display_interval 20 \
+  --display_interval 1 \
   --data_dir ${DATASET_DIR} \
   --output_dir ${OUTPUT_DIR} \
   --available_gpus 3 \

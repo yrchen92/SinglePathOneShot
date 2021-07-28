@@ -67,6 +67,10 @@ class DataProcessor(object):
         """Gets a collection of `InputExample`s for the train set."""
         raise NotImplementedError()
 
+    def get_train_aug_examples(self, data_dir):
+        """Gets a collection of `InputExample`s for the train set."""
+        raise NotImplementedError()
+
     def get_dev_examples(self, data_dir):
         """Gets a collection of `InputExample`s for the dev set."""
         raise NotImplementedError()
@@ -100,6 +104,12 @@ class MrpcProcessor(DataProcessor):
         logger.info("LOOKING AT {}".format(os.path.join(data_dir, "train.tsv")))
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+    
+    def get_train_aug_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {}".format(os.path.join(data_dir, "train_aug.tsv")))
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train_aug.tsv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
@@ -136,6 +146,12 @@ class MnliProcessor(DataProcessor):
         """See base class."""
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+    
+    def get_train_aug_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {}".format(os.path.join(data_dir, "train_aug.tsv")))
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train_aug.tsv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
@@ -192,7 +208,13 @@ class ColaProcessor(DataProcessor):
         """See base class."""
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
-
+    
+    def get_train_aug_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {}".format(os.path.join(data_dir, "train_aug.tsv")))
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train_aug.tsv")), "train")
+            
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
@@ -232,7 +254,13 @@ class Sst2Processor(DataProcessor):
         """See base class."""
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
-
+    
+    def get_train_aug_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {}".format(os.path.join(data_dir, "train_aug.tsv")))
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train_aug.tsv")), "train")
+            
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
@@ -268,7 +296,13 @@ class StsbProcessor(DataProcessor):
         """See base class."""
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
-
+    
+    def get_train_aug_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {}".format(os.path.join(data_dir, "train_aug.tsv")))
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train_aug.tsv")), "train")
+            
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
@@ -308,7 +342,13 @@ class QqpProcessor(DataProcessor):
         """See base class."""
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
-
+    
+    def get_train_aug_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {}".format(os.path.join(data_dir, "train_aug.tsv")))
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train_aug.tsv")), "train")
+            
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
@@ -353,7 +393,13 @@ class QnliProcessor(DataProcessor):
         """See base class."""
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
-
+    
+    def get_train_aug_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {}".format(os.path.join(data_dir, "train_aug.tsv")))
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train_aug.tsv")), "train")
+            
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
@@ -394,7 +440,13 @@ class RteProcessor(DataProcessor):
         """See base class."""
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
-
+    
+    def get_train_aug_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {}".format(os.path.join(data_dir, "train_aug.tsv")))
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train_aug.tsv")), "train")
+            
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
@@ -434,7 +486,13 @@ class WnliProcessor(DataProcessor):
         """See base class."""
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
-
+    
+    def get_train_aug_examples(self, data_dir):
+        """See base class."""
+        logger.info("LOOKING AT {}".format(os.path.join(data_dir, "train_aug.tsv")))
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train_aug.tsv")), "train")
+            
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(

@@ -18,6 +18,8 @@ from flops import get_cand_flops
 from torch.nn import CrossEntropyLoss
 from pytorch_transformers import AdamW
 
+from tqdm import tqdm
+
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
@@ -50,18 +52,29 @@ def fix_parameters(model):
     for name, param in model.named_parameters():
 	    param.requires_grad = False
 
-get_random_cand = lambda:tuple(np.random.randint(9) for i in range(6))
-def get_uniform_sample_cand(*,timeout=500):
-    return get_random_cand()
-    flops_l, flops_r, flops_step = 290, 360, 10
-    bins = [[i, i+flops_step] for i in range(flops_l, flops_r, flops_step)]
-    idx = np.random.randint(len(bins))
-    l, r = bins[idx]
-    for i in range(timeout):
-        cand = get_random_cand()
-        if l*1e6 <= get_cand_flops(cand) <= r*1e6:
-            return cand
-    return get_random_cand()
+def get_random_cell(n_out=4):
+    cell_arc = []
+    for oi in range(n_out):
+        for _ in range(oi+1):
+            cell_arc.append(np.random.randint(10))
+        if sum(cell_arc[-(oi+1):]) == 0:
+            return []
+    return cell_arc
+
+def get_uniform_sample_cand(n_layer=4, n_out=4, share_layer_arc=1, timeout=500):
+    if share_layer_arc == 1:
+        cell_arc = []
+        while len(cell_arc) == 0:
+            cell_arc = get_random_cell(n_out)
+        return  cell_arc * n_layer
+    else:
+        arc = []
+        for li in range(n_layer):
+            cell_arc = []
+            while len(cell_arc) == 0:
+                cell_arc = get_random_cell(n_out)
+            arc += cell_arc
+        return arc
 
 class DataIterator(object):
 
@@ -121,6 +134,8 @@ def get_args():
                         help="Set this flag if you are using an uncased model.")
     parser.add_argument('--no_segment', action='store_true',
                     help="force to remove segmentation ids")
+    parser.add_argument('--do_aug', action='store_true',
+                    help="force to remove segmentation ids")
 
     parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
@@ -133,12 +148,26 @@ def get_args():
     parser.add_argument("--weight_decay", default=0.0, type=float,
                         help="Weight deay if we apply some.")
 
+    parser.add_argument("--dropout_cell", default=0.1, type=float,
+                        help="Weight deay if we apply some.")
+    parser.add_argument("--dropout_alpha", default=0.1, type=float,
+                        help="Weight deay if we apply some.")                                    
+
     parser.add_argument('--eval', default=False, action='store_true')
+    parser.add_argument('--use_emb', default=False, action='store_true')
+    parser.add_argument('--finetune', default=False, action='store_true')
+    parser.add_argument('--arc', type=str, default=None, help='path for saving trained models')
+    parser.add_argument('--arc_mp', type=str, default=None, help='path for saving trained models')
     parser.add_argument('--total_iters', type=int, default=150000, help='total iters')
+    parser.add_argument('--num_op', type=int, default=6, help='total iters')
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
     parser.add_argument('--output_dir', type=str, default='./outputs', help='path for saving trained models')
     parser.add_argument('--alpha_kd', type=float, default=0.0, help='label smoothing')
 
+    parser.add_argument('--n_layer', type=int, default=4, help='label smoothing')
+    parser.add_argument('--n_out', type=int, default=4, help='label smoothing')
+    parser.add_argument('--share_layer_arc', type=int, default=1, help='label smoothing')
+ 
     # hyper-parameter search
     parser.add_argument("--local_rank", type=int, default=-1,
                     help="For distributed training: local_rank")
@@ -162,12 +191,17 @@ def get_args():
     args = parser.parse_args()
     return args
 
+def adjust_bn_momentum(model, iters):
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm1d):
+            m.momentum = 1 / iters
+
 def load_and_cache_examples(args, task, tokenizer, data_type="train"):
     processor = processors[task]()
     output_mode = output_modes[task]
     # Load data features from cache or dataset file
     cached_features_file = os.path.join(args.data_dir, 'cached_{}_{}_{}_{}'.format(
-        data_type,
+        data_type if not args.do_aug else data_type + '_aug',
         list(filter(None, args.model_name_or_path.split('/'))).pop(),
         str(args.max_seq_length),
         str(task)))
@@ -182,7 +216,10 @@ def load_and_cache_examples(args, task, tokenizer, data_type="train"):
             label_list[1], label_list[2] = label_list[2], label_list[1]
         examples = []
         if data_type == "train":
-            examples = processor.get_train_examples(args.data_dir)
+            if args.do_aug:
+                examples = processor.get_train_aug_examples(args.data_dir)
+            else:
+                examples = processor.get_train_examples(args.data_dir)
         elif data_type == "dev":
             examples = processor.get_dev_examples(args.data_dir)
         elif data_type == "test":
@@ -272,6 +309,7 @@ def main():
     set_seed(args)
 
     # Prepare GLUE task
+    task_name_ori = args.task_name
     args.task_name = args.task_name.lower()
     if args.task_name not in processors:
         raise ValueError("Task not found: %s" % (args.task_name))
@@ -310,15 +348,11 @@ def main():
     #     args.total_iters = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
     
     # valid
-    eval_dataset = load_and_cache_examples(args, args.task_name, tokenizer, data_type='dev')
-    if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
-        os.makedirs(args.output_dir)
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    # Note that DistributedSampler samples randomly
-    # eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
+    eval_dataset = load_and_cache_examples(args, args.task_name, tokenizer, data_type='dev')
     eval_sampler = SequentialSampler(eval_dataset)
     eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
-    eval_dataprovider = DataIterator(eval_dataloader)
+    # eval_dataprovider = DataIterator(eval_dataloader)
 
     if args.task_name == "mnli":
         eval_task_names_mm = "mnli-mm"
@@ -332,20 +366,32 @@ def main():
         eval_sampler_mm = SequentialSampler(eval_dataset_mm)
         eval_dataloader_mm = DataLoader(eval_dataset_mm, sampler=eval_sampler_mm, batch_size=args.eval_batch_size)
     
-    emb_w = t_model.bert.embeddings.word_embeddings.weight.clone().detach().cpu().numpy()
-    emb_p = t_model.bert.embeddings.position_embeddings.weight.clone().detach().cpu().numpy()
-    emb_t = t_model.bert.embeddings.token_type_embeddings.weight.clone().detach().cpu().numpy()
-    pca = PCA(n_components=args.hidden_size)
-    new_emb_w = pca.fit_transform(emb_w)
-    new_emb_w = torch.from_numpy(new_emb_w)
+    # emb_w = t_model.bert.embeddings.word_embeddings.weight.clone().detach().cpu().numpy()
+    # emb_p = t_model.bert.embeddings.position_embeddings.weight.clone().detach().cpu().numpy()
+    # emb_t = t_model.bert.embeddings.token_type_embeddings.weight.clone().detach().cpu().numpy()
+    # pca = PCA(n_components=args.hidden_size)
+    # new_emb_w = pca.fit_transform(emb_w)
+    # new_emb_w = torch.from_numpy(new_emb_w)
 
-    # model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, [new_emb_w])
-    # model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, [emb_w, emb_p, emb_t])
-    model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels)
+    if args.use_emb:
+        emb_w = torch.load('./checkpoint/emb_SST-2_small/word_embeddings.pt')
+        emb_p = torch.load('./checkpoint/emb_SST-2_small/position_embeddings.pt')
+        emb_t = torch.load('./checkpoint/emb_SST-2_small/token_type_embeddings.pt')
+        model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, args.n_layer, args.n_out, emb=[emb_w, emb_p, emb_t]).cuda()
+    else:
+        model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, args.n_layer, args.n_out).cuda()
+    
+    # for _ in range(20):
+    #     logger.info(get_uniform_sample_cand())
+    # exit(0)
+
+    if args.finetune:
+        args.arc = [int(i) for i in args.arc.replace(' ', '').split(',')]
+        logger.info(model.print_arc(args.arc))
     model.to(args.device)
 
     if args.local_rank in [-1, 0]:
-        logger.info(model)
+        # logger.info(model)
         logger.info(args)
         # Train!
         logger.info("***** Running training *****")
@@ -393,11 +439,24 @@ def main():
     # criterion_smooth = CrossEntropyLabelSmooth(num_labels, 0.1)
     criterion_smooth = CrossEntropyLoss()
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,
-                    lambda step : (1.0-step/args.total_iters) if step <= args.total_iters else 0, last_epoch=-1)
+    # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,
+    #                 lambda step : (1.0-step/args.total_iters) if step <= args.total_iters else 0, last_epoch=-1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 2000, 0.5, -1)        
 
     all_iters = 0
-    if args.auto_continue:
+    if args.finetune:
+        checkpoint_path = os.path.join('search_models', task_name_ori, 'checkpoint-latest.pth.tar')
+        checkpoint = torch.load(checkpoint_path, map_location=None if not args.no_cuda else 'cpu')
+        from collections import OrderedDict
+        new_state_dict = OrderedDict()
+        for k, v in checkpoint['state_dict'].items():
+            if 'module.' in k:
+                name = k[7:]
+            else:
+                name = k
+            new_state_dict[name] = v
+        # model.load_state_dict(new_state_dict, strict=True)
+    elif args.auto_continue:
         lastest_model, iters = get_lastest_model(args)
         if lastest_model is not None:
             if args.local_rank in [-1, 0]:
@@ -425,31 +484,38 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
                                                           output_device=args.local_rank,
                                                           find_unused_parameters=True)
-        # t_model = torch.nn.parallel.DistributedDataParallel(t_model, device_ids=[args.local_rank],
-        #                                                   output_device=args.local_rank,
-        #                                                   find_unused_parameters=True)
 
     args.optimizer = optimizer
     args.loss_function = criterion_smooth.cuda()
     args.scheduler = scheduler
+    args.train_dataloader = train_dataloader
     args.train_dataprovider = train_dataprovider
-    args.eval_dataprovider = eval_dataprovider
+    # args.eval_dataprovider = eval_dataprovider
     args.eval_dataloader = eval_dataloader
 
     if args.eval:
-        # if args.eval_resume is not None:
-        #     checkpoint = torch.load(args.eval_resume, map_location=None if not args.no_cuda else 'cpu')
-        #     model.load_state_dict(checkpoint, strict=True)
-        validate(model, device, args, all_iters=all_iters, eval_num=1000)    
+        validate(model, device, args, all_iters=all_iters, eval_num=100)    
         exit(0)
-
+    
+    best_result = 0
+    best_results = {}
     while all_iters < args.total_iters:
         all_iters = train(model, device, args, val_interval=args.val_interval, bn_process=False, all_iters=all_iters, t_model=t_model)
-        validate(model, device, args, all_iters=all_iters, eval_num=10)
-
-    # all_iters = train(model, device, args, val_interval=int(1280000/args.batch_size), bn_process=True, all_iters=all_iters)
-    # save_checkpoint({'state_dict': model.state_dict(),}, args.total_iters, tag='bnps-')
-
+        if args.finetune:
+            r, rs = validate(model, device, args, all_iters=all_iters, eval_num=1)
+        else:
+            r, rs = validate(model, device, args, all_iters=all_iters, eval_num=20)
+        if best_result < r:
+            best_result = r
+            best_results = rs
+        if args.local_rank in [-1, 0]:
+            log_info = ''
+            for key in sorted(best_results.keys()):
+                log_info += 'final_{} = {:.6f}\t'.format(key, best_results[key])
+            logger.info(log_info)
+            
+    return best_result, best_results
+    
 # def adjust_bn_momentum(model, iters):
 #     for m in model.modules():
 #         if isinstance(m, nn.BatchNorm1d):
@@ -469,10 +535,11 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
     # scheduler.step()
     tr_loss = 0.0
     for iters in range(1, val_interval + 1):
-        # if bn_process:
-        #     adjust_bn_momentum(model, iters)
+        if bn_process:
+            adjust_bn_momentum(model, iters)
         d_st = time.time()
         batch = train_dataprovider.next()
+        
         batch = tuple(t.to(args.device) for t in batch)
         inputs = {'input_ids':      batch[0],
                   'attention_mask': batch[1],
@@ -484,8 +551,22 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
         # get_random_cand = lambda:tuple(np.random.randint(4) for i in range(4))
         
         t_outputs = t_model(**inputs)
-        inputs['architecture'] = get_uniform_sample_cand()
+        if args.finetune:
+            inputs['architecture'] = args.arc
+            # inputs['architecture_mp'] = args.arc_mp
+        else:
+            arc = get_uniform_sample_cand(n_layer=args.n_layer, n_out=args.n_out, share_layer_arc=args.share_layer_arc)
+            inputs['architecture'] = arc
+            # inputs['architecture_mp'] = arc_mp
+
         output = model(**inputs)
+
+        # print(inputs['labels'])
+        # preds = output.detach().cpu().numpy()
+        # preds = np.argmax(preds, axis=1)
+        # print(torch.from_numpy(preds))
+        # print(inputs['architecture'])
+        # print(inputs['architecture_mp'])
         
         r_loss = loss_function(output, inputs['labels'])
         t_loss = cal_logit_loss(output, t_outputs[1].detach())
@@ -502,11 +583,11 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
         loss.backward()
         tr_loss += loss.item()
 
-        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1000000.0)
 
-        for p in model.parameters():
-            if p.grad is not None and p.grad.sum() == 0:
-                p.grad = None
+        # for p in model.parameters():
+        #     if p.grad is not None and p.grad.sum() == 0:
+        #         p.grad = None
 
         if iters % args.gradient_accumulation_steps == 0:
             optimizer.step()
@@ -522,7 +603,7 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
             elif args.output_mode == "regression":
                 preds = np.squeeze(preds)
             result = compute_metrics(args.task_name, preds, label_ids)
-            printInfo = 'TRAIN Iter {}: lr = {:.6f},\tloss = {:.6f},\t'.format(all_iters, scheduler.get_lr()[0], loss.item()) + \
+            printInfo = 'TRAIN Iter {}: lr = {:.6f},\tloss = {:.6f},\t'.format(all_iters, scheduler.get_last_lr()[0], loss.item()) + \
                         'r_loss = {:.6f},\tt_loss = {:.6f},\tgrad = {:.6f},\t'.format(r_loss.item(), t_loss.item(), total_norm) + \
                         'data_time = {:.6f},\ttrain_time = {:.6f}'.format(data_time, (time.time() - t1) / args.display_interval)
             for k, v in result.items():
@@ -538,21 +619,51 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
 
 def validate(model, device, args, *, all_iters=None, eval_num=1):
     loss_function = args.loss_function
-    eval_dataprovider = args.eval_dataprovider
-    model.eval()
-    max_val_iters = 250
+    eval_dataloader = args.eval_dataloader
     t1  = time.time()
     whole_result = []
+    whole_results = []
+
     for _ in range(eval_num):
         preds = None
         labels = None
         eval_loss = 0
-        eval_num = 0
+        eval_batch_num = 0
         results = {}
+        arc = get_uniform_sample_cand(n_layer=args.n_layer, n_out=args.n_out, share_layer_arc=args.share_layer_arc)
+        
+        # print('clear bn statics....')
+        # for m in model.modules():
+        #     if isinstance(m, torch.nn.BatchNorm1d):
+        #         m.running_mean = torch.zeros_like(m.running_mean)
+        #         m.running_var = torch.ones_like(m.running_var)
+
+        # print('train bn with training set (BN sanitize) ....')
+        # model.train()
+
+        # for batch in args.train_dataloader:
+        #     batch = tuple(t.to(args.device) for t in batch)
+        #     inputs = {'input_ids':      batch[0],
+        #             'attention_mask': batch[1],
+        #             'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] \
+        #                                             and not args.no_segment else None,
+        #             'labels':         batch[3]}
+        #     # get_random_cand = lambda:tuple(np.random.randint(4) for i in range(4))
+        #     if args.finetune:
+        #         inputs['architecture'] = args.arc
+        #         inputs['architecture_mp'] = args.arc_mp
+        #     else:
+        #         inputs['architecture'] = arc
+        #         inputs['architecture_mp'] = arc_mp
+        #     output = model(**inputs)
+        #     del batch, inputs, output
+        
+        # print('starting test....')
+        model.eval()
+
         with torch.no_grad():
-            # for _ in range(1, max_val_iters + 1):
-            for batch in args.eval_dataloader:
-                batch = eval_dataprovider.next()
+            for batch in eval_dataloader:
+                # batch = eval_dataprovider.next()
                 batch = tuple(t.to(args.device) for t in batch)
                 inputs = {'input_ids':      batch[0],
                         'attention_mask': batch[1],
@@ -561,13 +672,18 @@ def validate(model, device, args, *, all_iters=None, eval_num=1):
                         'labels':         batch[3]}
                 
                 # get_random_cand = lambda:tuple(np.random.randint(4) for i in range(4))
-                inputs['architecture'] = get_random_cand()
+                if args.finetune:
+                    inputs['architecture'] = args.arc
+                    # inputs['architecture_mp'] = args.arc_mp
+                else:
+                    inputs['architecture'] = arc
+                    # inputs['architecture_mp'] = arc_mp
                 output = model(**inputs)
 
                 if isinstance(output, tuple):
                     output = output[1]
 
-                eval_num += inputs['input_ids'].size(0)
+                eval_batch_num += 1
                 loss = loss_function(output, inputs['labels'])
                 eval_loss += loss.item()
                 
@@ -578,24 +694,62 @@ def validate(model, device, args, *, all_iters=None, eval_num=1):
                     preds = np.append(preds, output.detach().cpu().numpy(), axis=0)
                     labels = np.append(labels, inputs['labels'].detach().cpu().numpy(), axis=0)
 
-        eval_loss = eval_loss / eval_num
+        eval_loss = eval_loss / eval_batch_num
         if args.output_mode == "classification":
             preds = np.argmax(preds, axis=1)
         elif args.output_mode == "regression":
             preds = np.squeeze(preds)
         result = compute_metrics(args.task_name, preds, labels)
+        # print(preds)
+        # print(labels)
+        # print(sum(preds))
+        # print(sum(labels))
         result['eval_loss'] = eval_loss
+        result['iter_id'] = all_iters
         results.update(result)
         if args.local_rank in [-1, 0]:
             logger.info("***** Eval {} results *****".format(args.task_name))
             log_info = 'Iter {}:'.format(all_iters)
             for key in sorted(result.keys()):
                 log_info += '\teavl_{} = {:.6f}'.format(key, result[key])
-                if 'acc' in key or 'corr' in key:
-                    whole_result.append(result[key])
+                whole_results.append(result)
+                whole_result.append(result_for_sorting(args.task_name, result))
             log_info += '\n{}'.format(str(inputs['architecture']))
+            # log_info += '\n{}'.format(str(inputs['architecture_mp']))
+            logger.info(log_info)
+    if args.local_rank in [-1, 0]:
+        logger.info('{}_best:{}\t{}_worst:{}\t{}_average:{}'.format(all_iters, max(whole_result), all_iters, min(whole_result), all_iters, sum(whole_result)/len(whole_result)))
+        max_results = whole_results[np.argmax(whole_result)]
+        log_info = ''
+        for key in sorted(max_results.keys()):
+            log_info += 'best_{} = {:.6f}\t'.format(key, max_results[key])
         logger.info(log_info)
-    logger.info('best:{}\nworst:{}\naverage:{}'.format(max(whole_result), min(whole_result), sum(whole_result)/len(whole_result)))
+    
+    return result_for_sorting(args.task_name, max_results)
+
+def result_for_sorting(task_name, result):
+    if task_name == "cola":
+        return result["mcc"]
+    elif task_name == "sst-2":
+        return result["acc"]
+    elif task_name == "mrpc":
+        return result["acc_and_f1"]
+    elif task_name == "sts-b":
+        return result["corr"]
+    elif task_name == "qqp":
+        return result["acc_and_f1"]
+    elif task_name == "mnli":
+        return result["acc"]
+    elif task_name == "mnli-mm":
+        return result["mm_acc"]
+    elif task_name == "qnli":
+        return result["acc"]
+    elif task_name == "rte":
+        return result["acc"]
+    elif task_name == "wnli":
+        return result["acc"]
+    else:
+        raise KeyError(task_name)
 
 if __name__ == "__main__":
     main()
