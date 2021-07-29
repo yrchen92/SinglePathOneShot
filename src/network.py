@@ -11,7 +11,7 @@ class ShuffleNetV2_OneShot(nn.Module):
         super(ShuffleNetV2_OneShot, self).__init__()
         self.input_size = input_size
         self.n_layer = n_layer
-        self.n_out = n_out
+        self.n_cell = n_out
         # building first layer
         self.emb = emb
         if emb is None:
@@ -20,67 +20,64 @@ class ShuffleNetV2_OneShot(nn.Module):
             self.token_type_embeddings = nn.Embedding(2, input_size)
             emb_dim = input_size
         else:
-            # print(emb[0])
             self.word_embeddings = torch.nn.Embedding.from_pretrained(emb[0], freeze=False)
             self.position_embeddings = torch.nn.Embedding.from_pretrained(emb[1], freeze=False)
             self.token_type_embeddings = torch.nn.Embedding.from_pretrained(emb[2], freeze=False)
             emb_dim = emb[0].size(-1)
         self.embedding_transform = torch.nn.Linear(emb_dim, input_size)
         self.embedding_layernorm = torch.nn.LayerNorm(input_size)
-        self.embedding_dropout = torch.nn.Dropout(0.1)
+        self.embedding_dropout = torch.nn.Dropout(0.5)
         self.features = torch.nn.ModuleList()
         archIndex = 0
         # layer
         for layer_i in range(self.n_layer):
             self.features.append(torch.nn.ModuleList())
-            # node/output
-            for out_i in range(self.n_out):
-                layers = self.features[layer_i]
+            layers = self.features[layer_i]
+            for cell_i in range(self.n_cell):
                 layers.append(torch.nn.ModuleList())
-                # edge/opeartor
-                for op_i in range(out_i+1):
+                ops = layers[cell_i]
+                for op_i in range(cell_i + 1):
                     archIndex += 1
-                    ops = layers[out_i]
                     ops.append(torch.nn.ModuleList())
-                    for blockIndex in range(11):
+                    for blockIndex in range(10):
                         if blockIndex == 0:
                             # print('zero')
-                            ops[-1].append(ZeroOp())    
+                            ops[-1].append(ZeroOp())
                         elif blockIndex == 1:
+                            # print('skip')
+                            ops[-1].append(SkipOp())    
+                        elif blockIndex == 2:
                             # print('Conv3')
                             ops[-1].append(SimConv(input_size, input_size, 3))
-                        elif blockIndex == 2:
+                        elif blockIndex == 3:
                             # print('Conv5')
                             ops[-1].append(SimConv(input_size, input_size, 5))
-                        elif blockIndex == 3:
+                        elif blockIndex == 4:
                             # print('Conv7')
                             ops[-1].append(SimConv(input_size, input_size, 7))
-                        elif blockIndex == 4:
+                        elif blockIndex == 5:
                             # print('linear')
                             ops[-1].append(Linear(input_size, input_size))
-                        elif blockIndex == 5:
+                        elif blockIndex == 6:
                             # print('SelfAttention 1')
                             ops[-1].append(SelfAttention(input_size, 1))
-                        elif blockIndex == 6:
+                        elif blockIndex == 7:
                             # print('SelfAttention 4')        
                             ops[-1].append(SelfAttention(input_size, 4))
-                        elif blockIndex == 7:
+                        elif blockIndex == 8:
                             # print('maxpooling')
                             ops[-1].append(MaxPooling())
-                        elif blockIndex == 8:
+                        elif blockIndex == 9:
                             # print('avgpooling')
                             ops[-1].append(AvgPooling())
-                        elif blockIndex == 9:
-                            # print('skip')
-                            ops[-1].append(SkipOp())
                         elif blockIndex == 10:
-                            # print('skip')
+                            # print('RnnOp')
                             ops[-1].append(RnnOp(input_size))
                         else:
                             raise NotImplementedError
         self.archLen = archIndex
         self.g_pooling = GeneralizedPooler(input_size, input_size)
-        self.final_dropout = torch.nn.Dropout(0.1)
+        self.final_dropout = torch.nn.Dropout(0.5)
         self.classifier = nn.Sequential(
             nn.Linear(input_size, n_class))
         self._initialize_weights()
@@ -111,18 +108,18 @@ class ShuffleNetV2_OneShot(nn.Module):
         for layer_i in range(self.n_layer):
             layers = self.features[layer_i]
             layers_outs = [x]
-            for out_i in range(self.n_out):
-                ops = layers[out_i]
+            for cell_i in range(self.n_cell):
+                ops = layers[cell_i]
                 ops_outs = []
-                for op_i in range(out_i+1):
+                for op_i in range(cell_i + 1):
                     op = ops[op_i][architecture[arc_i]]
                     ops_outs.append(op(layers_outs[op_i], attention_mask))
                     arc_i += 1
                 layers_outs.append(sum(ops_outs)/len(ops_outs))
             x = layers_outs[-1]
             
-        # x = self.g_pooling(x, attention_mask)
-        x = self.global_max_pool(x, attention_mask)
+        x = self.g_pooling(x, attention_mask)
+        # x = self.global_max_pool(x, attention_mask)
         # x = torch.sum(x, dim=1)
         # x = self.final_tanh(x)
         x = self.final_dropout(x)

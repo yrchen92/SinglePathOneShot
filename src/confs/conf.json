@@ -1,0 +1,7 @@
+[
+    {
+        "name": "alpha_kd",
+        "type": "choice",
+        "values": [0.1, 0.0]
+    }
+]

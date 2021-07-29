@@ -37,8 +37,6 @@ from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
 
 logger = logging.getLogger(__name__)
 
-
-
 ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig, XLNetConfig, XLMConfig, RobertaConfig)), ())
 
 MODEL_CLASSES = {
@@ -191,6 +189,8 @@ def get_args():
     args = parser.parse_args()
     return args
 
+args = get_args()
+
 def adjust_bn_momentum(model, iters):
     for m in model.modules():
         if isinstance(m, nn.BatchNorm1d):
@@ -264,8 +264,8 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-def main():
-    args = get_args()
+def main(args):
+    # args = get_args()
 
     args.output_dir = os.path.join(args.output_dir, "jobs", str(args.job_id))
     if not os.path.exists(args.output_dir):
@@ -456,6 +456,7 @@ def main():
                 name = k
             new_state_dict[name] = v
         # model.load_state_dict(new_state_dict, strict=True)
+
     elif args.auto_continue:
         lastest_model, iters = get_lastest_model(args)
         if lastest_model is not None:
@@ -490,7 +491,6 @@ def main():
     args.scheduler = scheduler
     args.train_dataloader = train_dataloader
     args.train_dataprovider = train_dataprovider
-    # args.eval_dataprovider = eval_dataprovider
     args.eval_dataloader = eval_dataloader
 
     if args.eval:
@@ -632,33 +632,6 @@ def validate(model, device, args, *, all_iters=None, eval_num=1):
         results = {}
         arc = get_uniform_sample_cand(n_layer=args.n_layer, n_out=args.n_out, share_layer_arc=args.share_layer_arc)
         
-        # print('clear bn statics....')
-        # for m in model.modules():
-        #     if isinstance(m, torch.nn.BatchNorm1d):
-        #         m.running_mean = torch.zeros_like(m.running_mean)
-        #         m.running_var = torch.ones_like(m.running_var)
-
-        # print('train bn with training set (BN sanitize) ....')
-        # model.train()
-
-        # for batch in args.train_dataloader:
-        #     batch = tuple(t.to(args.device) for t in batch)
-        #     inputs = {'input_ids':      batch[0],
-        #             'attention_mask': batch[1],
-        #             'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] \
-        #                                             and not args.no_segment else None,
-        #             'labels':         batch[3]}
-        #     # get_random_cand = lambda:tuple(np.random.randint(4) for i in range(4))
-        #     if args.finetune:
-        #         inputs['architecture'] = args.arc
-        #         inputs['architecture_mp'] = args.arc_mp
-        #     else:
-        #         inputs['architecture'] = arc
-        #         inputs['architecture_mp'] = arc_mp
-        #     output = model(**inputs)
-        #     del batch, inputs, output
-        
-        # print('starting test....')
         model.eval()
 
         with torch.no_grad():
@@ -717,6 +690,7 @@ def validate(model, device, args, *, all_iters=None, eval_num=1):
             log_info += '\n{}'.format(str(inputs['architecture']))
             # log_info += '\n{}'.format(str(inputs['architecture_mp']))
             logger.info(log_info)
+
     if args.local_rank in [-1, 0]:
         logger.info('{}_best:{}\t{}_worst:{}\t{}_average:{}'.format(all_iters, max(whole_result), all_iters, min(whole_result), all_iters, sum(whole_result)/len(whole_result)))
         max_results = whole_results[np.argmax(whole_result)]
@@ -725,7 +699,7 @@ def validate(model, device, args, *, all_iters=None, eval_num=1):
             log_info += 'best_{} = {:.6f}\t'.format(key, max_results[key])
         logger.info(log_info)
     
-    return result_for_sorting(args.task_name, max_results)
+    return result_for_sorting(args.task_name, max_results), max_results
 
 def result_for_sorting(task_name, result):
     if task_name == "cola":
@@ -752,5 +726,5 @@ def result_for_sorting(task_name, result):
         raise KeyError(task_name)
 
 if __name__ == "__main__":
-    main()
+    main(args)
 
