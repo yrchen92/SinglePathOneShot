@@ -1,7 +1,27 @@
 [
     {
+        "name": "learning_rate",
+        "type": "choice",
+        "values": [1e-3, 2e-3, 3e-3]
+    },
+    {
         "name": "alpha_kd",
         "type": "choice",
-        "values": [0.1, 0.0]
+        "values": [1.0, 0.0, 0.5]
+    },
+    {
+        "name": "n_layer",
+        "type": "choice",
+        "values": [1, 2, 3]
+    },
+    {
+        "name": "per_gpu_train_batch_size",
+        "type": "choice",
+        "values": [128, 32]
+    },
+    {
+        "name": "hidden_size",
+        "type": "choice",
+        "values": [128, 256, 512]
     }
 ]

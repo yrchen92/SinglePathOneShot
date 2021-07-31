@@ -50,27 +50,27 @@ def fix_parameters(model):
     for name, param in model.named_parameters():
 	    param.requires_grad = False
 
-def get_random_cell(n_out=4):
+def get_random_cell(n_cell):
     cell_arc = []
-    for oi in range(n_out):
+    for oi in range(n_cell):
         for _ in range(oi+1):
             cell_arc.append(np.random.randint(10))
         if sum(cell_arc[-(oi+1):]) == 0:
             return []
     return cell_arc
 
-def get_uniform_sample_cand(n_layer=4, n_out=4, share_layer_arc=1, timeout=500):
+def get_uniform_sample_cand(n_layer, n_cell, share_layer_arc=1, timeout=500):
     if share_layer_arc == 1:
         cell_arc = []
         while len(cell_arc) == 0:
-            cell_arc = get_random_cell(n_out)
+            cell_arc = get_random_cell(n_cell)
         return  cell_arc * n_layer
     else:
         arc = []
         for li in range(n_layer):
             cell_arc = []
             while len(cell_arc) == 0:
-                cell_arc = get_random_cell(n_out)
+                cell_arc = get_random_cell(n_cell)
             arc += cell_arc
         return arc
 
@@ -163,7 +163,7 @@ def get_args():
     parser.add_argument('--alpha_kd', type=float, default=0.0, help='label smoothing')
 
     parser.add_argument('--n_layer', type=int, default=4, help='label smoothing')
-    parser.add_argument('--n_out', type=int, default=4, help='label smoothing')
+    parser.add_argument('--n_cell', type=int, default=4, help='label smoothing')
     parser.add_argument('--share_layer_arc', type=int, default=1, help='label smoothing')
  
     # hyper-parameter search
@@ -263,6 +263,17 @@ def set_seed(args):
     torch.manual_seed(args.seed)
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
+
+def get_loss_func(kd_alpha, output, bert_prob, real_label, emb=None):
+    criterion_mse = torch.nn.MSELoss().cuda()
+    criterion_ce = torch.nn.CrossEntropyLoss().cuda()
+    r_loss = criterion_ce(output, real_label)
+    t_loss = criterion_mse(output, bert_prob)
+    loss = (1 - kd_alpha) * r_loss + kd_alpha * t_loss
+    if emb is not None:
+        e_loss = criterion_mse(output, emb)
+        loss += kd_alpha * e_loss
+    return loss
 
 def main(args):
     # args = get_args()
@@ -377,9 +388,9 @@ def main(args):
         emb_w = torch.load('./checkpoint/emb_SST-2_small/word_embeddings.pt')
         emb_p = torch.load('./checkpoint/emb_SST-2_small/position_embeddings.pt')
         emb_t = torch.load('./checkpoint/emb_SST-2_small/token_type_embeddings.pt')
-        model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, args.n_layer, args.n_out, emb=[emb_w, emb_p, emb_t]).cuda()
+        model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, args.n_layer, args.n_cell, emb=[emb_w, emb_p, emb_t]).cuda()
     else:
-        model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, args.n_layer, args.n_out).cuda()
+        model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, args.n_layer, args.n_cell).cuda()
     
     # for _ in range(20):
     #     logger.info(get_uniform_sample_cand())
@@ -387,7 +398,10 @@ def main(args):
 
     if args.finetune:
         args.arc = [int(i) for i in args.arc.replace(' ', '').split(',')]
-        logger.info(model.print_arc(args.arc))
+        if len(args.arc) * args.n_layer == model.archLen:
+            args.arc = args.arc * args.n_layer
+        assert model.archLen == len(args.arc), 'arclen:{}, arch:{}'.format(model.archLen, len(args.arc))
+        # logger.info(model.print_arc(args.arc))
     model.to(args.device)
 
     if args.local_rank in [-1, 0]:
@@ -424,6 +438,8 @@ def main(args):
         t_num_params = t_num_params / 1e6
         t_num_params_grad = t_num_params_grad / 1e6
         logger.info("t_model have {:.2f}/{:.2f}M parameters in total\tmodel have {:.2f}M parameters in total\n".format(t_num_params_grad, t_num_params, num_params))    
+        if args.finetune:
+            logger.info("target model has {:.2f}M parameters in total\n".format(model.get_arc_parameters(args.arc)))  
 
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
@@ -499,6 +515,7 @@ def main(args):
     
     best_result = 0
     best_results = {}
+    early_stop = 0
     while all_iters < args.total_iters:
         all_iters = train(model, device, args, val_interval=args.val_interval, bn_process=False, all_iters=all_iters, t_model=t_model)
         if args.finetune:
@@ -506,13 +523,18 @@ def main(args):
         else:
             r, rs = validate(model, device, args, all_iters=all_iters, eval_num=20)
         if best_result < r:
+            early_stop = 0
             best_result = r
             best_results = rs
+        else:
+            early_stop += 1
         if args.local_rank in [-1, 0]:
             log_info = ''
             for key in sorted(best_results.keys()):
                 log_info += 'final_{} = {:.6f}\t'.format(key, best_results[key])
             logger.info(log_info)
+        if early_stop >= 10:
+            break
             
     return best_result, best_results
     
@@ -553,11 +575,9 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
         t_outputs = t_model(**inputs)
         if args.finetune:
             inputs['architecture'] = args.arc
-            # inputs['architecture_mp'] = args.arc_mp
         else:
-            arc = get_uniform_sample_cand(n_layer=args.n_layer, n_out=args.n_out, share_layer_arc=args.share_layer_arc)
+            arc = get_uniform_sample_cand(n_layer=args.n_layer, n_cell=args.n_cell, share_layer_arc=args.share_layer_arc)
             inputs['architecture'] = arc
-            # inputs['architecture_mp'] = arc_mp
 
         output = model(**inputs)
 
@@ -568,9 +588,10 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
         # print(inputs['architecture'])
         # print(inputs['architecture_mp'])
         
-        r_loss = loss_function(output, inputs['labels'])
-        t_loss = cal_logit_loss(output, t_outputs[1].detach())
-        loss = (1 - args.alpha_kd) * r_loss + args.alpha_kd * t_loss
+        # r_loss = loss_function(output, inputs['labels'])
+        # t_loss = cal_logit_loss(output, t_outputs[1].detach())
+        # loss = (1 - args.alpha_kd) * r_loss + args.alpha_kd * t_loss
+        loss = get_loss_func(args.alpha_kd, output, t_outputs[1].detach(), inputs['labels'])
         if args.n_gpu > 1:
             r_loss = r_loss.mean()
             t_loss = t_loss.mean()
@@ -604,7 +625,7 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
                 preds = np.squeeze(preds)
             result = compute_metrics(args.task_name, preds, label_ids)
             printInfo = 'TRAIN Iter {}: lr = {:.6f},\tloss = {:.6f},\t'.format(all_iters, scheduler.get_last_lr()[0], loss.item()) + \
-                        'r_loss = {:.6f},\tt_loss = {:.6f},\tgrad = {:.6f},\t'.format(r_loss.item(), t_loss.item(), total_norm) + \
+                        'grad = {:.6f},\t'.format(total_norm) + \
                         'data_time = {:.6f},\ttrain_time = {:.6f}'.format(data_time, (time.time() - t1) / args.display_interval)
             for k, v in result.items():
                 printInfo += ',\t{}={:.6f}'.format(k, v)
@@ -630,7 +651,7 @@ def validate(model, device, args, *, all_iters=None, eval_num=1):
         eval_loss = 0
         eval_batch_num = 0
         results = {}
-        arc = get_uniform_sample_cand(n_layer=args.n_layer, n_out=args.n_out, share_layer_arc=args.share_layer_arc)
+        arc = get_uniform_sample_cand(n_layer=args.n_layer, n_cell=args.n_cell, share_layer_arc=args.share_layer_arc)
         
         model.eval()
 
@@ -647,10 +668,8 @@ def validate(model, device, args, *, all_iters=None, eval_num=1):
                 # get_random_cand = lambda:tuple(np.random.randint(4) for i in range(4))
                 if args.finetune:
                     inputs['architecture'] = args.arc
-                    # inputs['architecture_mp'] = args.arc_mp
                 else:
                     inputs['architecture'] = arc
-                    # inputs['architecture_mp'] = arc_mp
                 output = model(**inputs)
 
                 if isinstance(output, tuple):

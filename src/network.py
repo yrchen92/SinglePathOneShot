@@ -7,11 +7,11 @@ from blocks import *
 
 class ShuffleNetV2_OneShot(nn.Module):
 
-    def __init__(self, n_vocab, input_size=128, n_class=2, n_layer=4, n_out=4, emb=None):
+    def __init__(self, n_vocab, input_size=128, n_class=2, n_layer=4, n_cell=4, emb=None):
         super(ShuffleNetV2_OneShot, self).__init__()
         self.input_size = input_size
         self.n_layer = n_layer
-        self.n_cell = n_out
+        self.n_cell = n_cell
         # building first layer
         self.emb = emb
         if emb is None:
@@ -78,9 +78,49 @@ class ShuffleNetV2_OneShot(nn.Module):
         self.archLen = archIndex
         self.g_pooling = GeneralizedPooler(input_size, input_size)
         self.final_dropout = torch.nn.Dropout(0.5)
+        self.fc1 = nn.Linear(input_size, 512)
         self.classifier = nn.Sequential(
-            nn.Linear(input_size, n_class))
+            nn.Linear(512, n_class))
         self._initialize_weights()
+    
+    def get_arc_parameters(self, architecture=None):
+        num_params = 0
+        if architecture is None:
+            for param in self.parameters():
+                if param.requires_grad:
+                    num_params += param.numel()
+        else:
+            assert self.archLen == len(architecture), 'arclen:{}, arch:{}'.format(self.archLen, len(architecture))
+            arc_i = 0
+            for n, param in self.named_parameters():
+                if 'features' not in n:
+                    num_params += param.numel()
+            for layer_i in range(self.n_layer):
+                layers = self.features[layer_i]
+                for cell_i in range(self.n_cell):
+                    ops = layers[cell_i]
+                    for op_i in range(cell_i + 1):
+                        op = ops[op_i][architecture[arc_i]]
+                        for opp in op.parameters():
+                            if opp.requires_grad:
+                                num_params += opp.numel()
+                        arc_i += 1
+        return num_params / 1e6
+
+    def print_arc(self, architecture=None):
+        assert self.archLen == len(architecture), 'arclen:{}, arch:{}'.format(self.archLen, len(architecture))
+        arc_i = 0
+        arc_str = 'current model:\n{}'.format(str(architecture))
+        for layer_i in range(self.n_layer):
+            layers = self.features[layer_i]
+            for cell_i in range(self.n_cell):
+                ops = layers[cell_i]
+                for op_i in range(cell_i+1):
+                    op = ops[op_i][architecture[arc_i]]
+                    arc_str += '\n{}'.format(str(op))
+                    arc_i += 1
+        return arc_str
+
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
                 position_ids=None, head_mask=None, architecture=None):
@@ -123,22 +163,11 @@ class ShuffleNetV2_OneShot(nn.Module):
         # x = torch.sum(x, dim=1)
         # x = self.final_tanh(x)
         x = self.final_dropout(x)
+        x = self.fc1(x)
         x = self.classifier(x)
         return x
 
-    def print_arc(self, architecture=None):
-        assert self.archLen == len(architecture), 'arclen:{}, arch:{}'.format(self.archLen, len(architecture))
-        arc_i = 0
-        arc_str = 'current model:\n{}'.format(str(architecture))
-        for layer_i in range(self.n_layer):
-            layers = self.features[layer_i]
-            for out_i in range(self.n_out):
-                ops = layers[out_i]
-                for op_i in range(out_i+1):
-                    op = ops[op_i][architecture[arc_i]]
-                    arc_str += '\n{}'.format(str(op))
-                    arc_i += 1
-        return arc_str
+
 
     def global_max_pool(self, x, mask):
         # mask = torch.eq(mask.float(), 0.0).long()
