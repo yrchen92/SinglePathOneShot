@@ -140,23 +140,78 @@ class Linear(nn.Module):
         inputs = self.linear(inputs)
         return inputs
 
+class SVDLinear(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(SVDLinear, self).__init__()
+        self.qmat1 = nn.Parameter(torch.zeros([in_channel, 32]).float().cuda())
+        self.qmat2 = nn.Parameter(torch.zeros([32, out_channel]).float().cuda())
+        self.b = nn.Parameter(torch.zeros(out_channel).float().cuda())
+        self.to_dim = 32
+        self.apply(self.init_bert_weights)
+    
+    def init_bert_weights(self, module):
+        self.qmat1.data.normal_(mean=0.0, std=0.02)
+        self.qmat2.data.normal_(mean=0.0, std=0.02)
+        
+    def forward(self, inputs, mask=None):
+        inputs = gelu(inputs)
+        x = torch.matmul(torch.matmul(inputs, self.qmat2[:self.to_dim, :].t()),self.qmat1[:, :self.to_dim].t()) + self.b
+        return inputs
+
 class SimConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernal_size, dilation=1):
         super(SimConv, self).__init__()
         # self.relu = nn.ReLU()
         self.conv = nn.Conv1d(in_channels, out_channels, kernal_size, 1, bias=True,
                           padding= dilation * (kernal_size - 1) // 2, dilation=dilation)
-        # self.bn = nn.BatchNorm1d(out_channels, affine=False, track_running_stats=False)
-        # self.ln = torch.nn.LayerNorm(out_channels)
         
     def forward(self, inputs, mask=None):
         inputs = gelu(inputs)
         inputs = torch.transpose(inputs, 1, 2)  # to (N, C, L)
-        # inputs = self.relu(inputs)
         inputs = self.conv(inputs)
         inputs = torch.transpose(inputs, 1, 2)  # to (N, L, C)
-        # inputs = self.ln(inputs)
         return inputs
+
+class SepConv(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size, stride=1):
+        super(SepConv, self).__init__()
+        padding = (kernel_size - 1) // 2
+        self.conv1 = nn.Conv1d(in_channel, in_channel, kernel_size, stride, padding, groups=in_channel)
+        # self.conv2 = nn.Conv1d(in_channel, out_channel, kernel_size=1, stride=1, padding=0)
+        self.linear = nn.Linear(in_channel, out_channel)
+
+    def forward(self, inputs, mask=None):
+        x = gelu(inputs)
+        x = torch.transpose(x, 1, 2)  # to (N, C, L)
+        x = self.conv1(x)
+        # x = self.conv2(x)
+        x = torch.transpose(x, 1, 2)  # to (N, C, L)
+        x = self.linear(x)
+        return x
+
+class SVDSepConv(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size, stride=1):
+        super(SVDSepConv, self).__init__()
+        padding = (kernel_size - 1) // 2
+        self.conv1 = nn.Conv1d(in_channel, in_channel, kernel_size, stride, padding, groups=in_channel)
+        # self.conv2 = nn.Conv1d(in_channel, out_channel, kernel_size=1, stride=1, padding=0)
+        self.qmat1 = nn.Parameter(torch.zeros([in_channel, 32]).float().cuda())
+        self.qmat2 = nn.Parameter(torch.zeros([32, out_channel]).float().cuda())
+        self.b = nn.Parameter(torch.zeros(out_channel).float().cuda())
+        self.to_dim = 32
+        self.apply(self.init_bert_weights)
+
+    def init_bert_weights(self, module):
+        self.qmat1.data.normal_(mean=0.0, std=0.02)
+        self.qmat2.data.normal_(mean=0.0, std=0.02)
+
+    def forward(self, inputs, mask=None):
+        x = gelu(inputs)
+        x = torch.transpose(x, 1, 2)  # to (N, C, L)
+        x = self.conv1(x)
+        x = torch.transpose(x, 1, 2)  # to (N, C, L)
+        x = torch.matmul(torch.matmul(x, self.qmat2[:self.to_dim, :].t()),self.qmat1[:, :self.to_dim].t()) + self.b
+        return x
 
 class SelfAttention(nn.Module):
     def __init__(self, hidden_size, num_attention_heads=1):
@@ -224,6 +279,91 @@ class SelfAttention(nn.Module):
 
         return outputs
 
+class SVDSelfAttention(nn.Module):
+    def __init__(self, hidden_size, num_attention_heads=1):
+        super(SVDSelfAttention, self).__init__()
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                "The hidden size (%d) is not a multiple of the number of attention "
+                "heads (%d)" % (hidden_size, num_attention_heads))
+
+        # self.relu = nn.ReLU()
+
+        self.num_attention_heads = num_attention_heads
+        self.attention_head_size = int(hidden_size / num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+        self.qmat1 = nn.Parameter(torch.zeros([hidden_size, 32]).float().cuda())
+        self.qmat2 = nn.Parameter(torch.zeros([32, hidden_size]).float().cuda())
+        self.kmat1 = nn.Parameter(torch.zeros([hidden_size, 32]).float().cuda())
+        self.kmat2 = nn.Parameter(torch.zeros([32, hidden_size]).float().cuda())
+        self.vmat1 = nn.Parameter(torch.zeros([hidden_size, 32]).float().cuda())
+        self.vmat2 = nn.Parameter(torch.zeros([32, hidden_size]).float().cuda())
+        self.to_dim = 32
+
+        self.dropout = nn.Dropout(0.1)
+        self.apply(self.init_bert_weights)
+
+    def transpose_for_scores(self, x):
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def init_bert_weights(self, module):
+        self.qmat1.data.normal_(mean=0.0, std=0.02)
+        self.qmat2.data.normal_(mean=0.0, std=0.02)
+        self.kmat1.data.normal_(mean=0.0, std=0.02)
+        self.kmat2.data.normal_(mean=0.0, std=0.02)
+        self.vmat1.data.normal_(mean=0.0, std=0.02)
+        self.vmat2.data.normal_(mean=0.0, std=0.02)
+
+    def forward(self, hidden_states, attention_mask):
+
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+        hidden_states = gelu(hidden_states)
+
+        # mixed_query_layer = self.query(hidden_states)
+        # mixed_key_layer = self.key(hidden_states)
+        # mixed_value_layer = self.value(hidden_states)
+        mixed_query_layer = torch.matmul(torch.matmul(hidden_states, self.qmat2[:self.to_dim, :].t()),
+                                             self.qmat1[:, :self.to_dim].t())
+        mixed_key_layer = torch.matmul(torch.matmul(hidden_states, self.kmat2[:self.to_dim, :].t()),
+                                        self.kmat1[:, :self.to_dim].t())
+        mixed_value_layer = torch.matmul(torch.matmul(hidden_states, self.vmat2[:self.to_dim, :].t()),
+                                            self.vmat1[:, :self.to_dim].t())
+
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+        key_layer = self.transpose_for_scores(mixed_key_layer)
+        value_layer = self.transpose_for_scores(mixed_value_layer)
+
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
+        # print(attention_scores.size())
+        # print(extended_attention_mask.size())
+        attention_scores = attention_scores + extended_attention_mask
+
+        # Normalize the attention scores to probabilities.
+        attention_probs = nn.Softmax(dim=-1)(attention_scores)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        attention_probs = self.dropout(attention_probs)
+
+        context_layer = torch.matmul(attention_probs, value_layer)
+
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+
+        outputs = context_layer
+
+        return outputs
+
 class SkipOp(nn.Module):
     def __init__(self):
         super(SkipOp, self).__init__()
@@ -232,6 +372,26 @@ class SkipOp(nn.Module):
     def forward(self, inputs, mask=None):
         # inputs = self.relu(inputs)
         return inputs
+
+class LSTMOp(nn.Module):
+    def __init__(self, hidden_size):
+        super(LSTMOp, self).__init__()
+        self.rnn = nn.LSTM(hidden_size,
+                           hidden_size,
+                           num_layers=1,
+                           bidirectional=True,
+                           dropout=0.5)
+        self.linear = nn.Linear(hidden_size * 2, hidden_size)
+
+    def forward(self, inputs, mask=None):
+        inputs = inputs.transpose(0, 1)
+        x, hidden = self.rnn(inputs)
+        # hidden, cell = hidden
+        # hidden = torch.cat((hidden[-2, :, :], hidden[-1, :, :]), dim=1)
+        x = x.transpose(0, 1)
+        x = self.linear(x)
+        return x
+
 
 class RnnOp(nn.Module):
     def __init__(self, hidden_size):

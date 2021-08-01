@@ -53,8 +53,12 @@ def fix_parameters(model):
 def get_random_cell(n_cell):
     cell_arc = []
     for oi in range(n_cell):
-        for _ in range(oi+1):
-            cell_arc.append(np.random.randint(10))
+        for ci in range(oi+1):
+            p = np.random.randint(2)
+            if ci < oi and p < 1:
+                cell_arc.append(np.random.randint(2))
+            else:
+                cell_arc.append(np.random.randint(10))
         if sum(cell_arc[-(oi+1):]) == 0:
             return []
     return cell_arc
@@ -153,6 +157,7 @@ def get_args():
 
     parser.add_argument('--eval', default=False, action='store_true')
     parser.add_argument('--use_emb', default=False, action='store_true')
+    parser.add_argument('--pre_emb_dir', type=str, default='./checkpoint/emb_small',)
     parser.add_argument('--finetune', default=False, action='store_true')
     parser.add_argument('--arc', type=str, default=None, help='path for saving trained models')
     parser.add_argument('--arc_mp', type=str, default=None, help='path for saving trained models')
@@ -161,6 +166,10 @@ def get_args():
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
     parser.add_argument('--output_dir', type=str, default='./outputs', help='path for saving trained models')
     parser.add_argument('--alpha_kd', type=float, default=0.0, help='label smoothing')
+    parser.add_argument('--alpha_ld', type=float, default=0.0, help='label smoothing')
+    parser.add_argument('--alpha_dp', type=float, default=0.5, help='label smoothing')
+    parser.add_argument('--alpha_ld_num', type=int, default=0, help='label smoothing')
+    parser.add_argument('--early_stop', type=int, default=10, help='label smoothing')
 
     parser.add_argument('--n_layer', type=int, default=4, help='label smoothing')
     parser.add_argument('--n_cell', type=int, default=4, help='label smoothing')
@@ -264,20 +273,34 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-def get_loss_func(kd_alpha, output, bert_prob, real_label, emb=None):
+def get_loss_func(kd_alpha, output, bert_prob, real_label):
     criterion_mse = torch.nn.MSELoss().cuda()
     criterion_ce = torch.nn.CrossEntropyLoss().cuda()
     r_loss = criterion_ce(output, real_label)
     t_loss = criterion_mse(output, bert_prob)
     loss = (1 - kd_alpha) * r_loss + kd_alpha * t_loss
-    if emb is not None:
-        e_loss = criterion_mse(output, emb)
-        loss += kd_alpha * e_loss
+    return loss
+
+def get_layer_loss_func(t_outputs, outputs, mask, training=True):
+    assert (len(t_outputs) - 1) % (len(outputs) - 1) == 0
+    mul = (len(t_outputs) - 1) / (len(outputs) - 1)
+    criterion_mse = torch.nn.MSELoss().cuda()
+    mask = mask[:,:outputs[0].size(1)]
+    extended_mask = mask.unsqueeze(2).to(dtype=outputs[0].dtype)
+    if training:
+        emb_loss = criterion_mse(outputs[0] * extended_mask, t_outputs[0] * extended_mask)
+    else:
+        emb_loss = criterion_mse(outputs[0] * extended_mask, t_outputs[0].detach() * extended_mask)
+    loss = emb_loss
+    for i in range(1, len(outputs)):
+        if training:
+            loss += criterion_mse(outputs[i] * extended_mask, t_outputs[int(mul*i)] * extended_mask)
+        else:
+            loss += criterion_mse(outputs[i] * extended_mask, t_outputs[int(mul*i)].detach() * extended_mask)
+
     return loss
 
 def main(args):
-    # args = get_args()
-
     args.output_dir = os.path.join(args.output_dir, "jobs", str(args.job_id))
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
@@ -335,7 +358,8 @@ def main(args):
 
     args.model_type = args.model_type.lower()
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
+    config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, 
+                                            num_labels=num_labels, finetuning_task=args.task_name, output_hidden_states=True)
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
     t_model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
 
@@ -385,12 +409,12 @@ def main(args):
     # new_emb_w = torch.from_numpy(new_emb_w)
 
     if args.use_emb:
-        emb_w = torch.load('./checkpoint/emb_SST-2_small/word_embeddings.pt')
-        emb_p = torch.load('./checkpoint/emb_SST-2_small/position_embeddings.pt')
-        emb_t = torch.load('./checkpoint/emb_SST-2_small/token_type_embeddings.pt')
-        model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, args.n_layer, args.n_cell, emb=[emb_w, emb_p, emb_t]).cuda()
+        emb_w = torch.load(os.path.join(args.pre_emb_dir, 'word_embeddings.pt'))
+        emb_p = torch.load(os.path.join(args.pre_emb_dir, 'position_embeddings.pt'))
+        emb_t = torch.load(os.path.join(args.pre_emb_dir, 'token_type_embeddings.pt'))
+        model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, args.n_layer, args.n_cell, dp=args.alpha_dp, emb=[emb_w, emb_p, emb_t]).cuda()
     else:
-        model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, args.n_layer, args.n_cell).cuda()
+        model = ShuffleNetV2_OneShot(config.vocab_size, args.hidden_size, num_labels, args.n_layer, args.n_cell, dp=args.alpha_dp).cuda()
     
     # for _ in range(20):
     #     logger.info(get_uniform_sample_cand())
@@ -401,7 +425,7 @@ def main(args):
         if len(args.arc) * args.n_layer == model.archLen:
             args.arc = args.arc * args.n_layer
         assert model.archLen == len(args.arc), 'arclen:{}, arch:{}'.format(model.archLen, len(args.arc))
-        # logger.info(model.print_arc(args.arc))
+        logger.info(model.print_arc(args.arc))
     model.to(args.device)
 
     if args.local_rank in [-1, 0]:
@@ -446,7 +470,7 @@ def main(args):
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon, weight_decay=args.weight_decay)
 
     # optimizer = torch.optim.SGD(get_parameters(model),
     #                             lr=args.learning_rate,
@@ -457,20 +481,20 @@ def main(args):
 
     # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,
     #                 lambda step : (1.0-step/args.total_iters) if step <= args.total_iters else 0, last_epoch=-1)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 2000, 0.5, -1)        
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 10000, 1.0, -1)       
 
     all_iters = 0
     if args.finetune:
         checkpoint_path = os.path.join('search_models', task_name_ori, 'checkpoint-latest.pth.tar')
-        checkpoint = torch.load(checkpoint_path, map_location=None if not args.no_cuda else 'cpu')
-        from collections import OrderedDict
-        new_state_dict = OrderedDict()
-        for k, v in checkpoint['state_dict'].items():
-            if 'module.' in k:
-                name = k[7:]
-            else:
-                name = k
-            new_state_dict[name] = v
+        # checkpoint = torch.load(checkpoint_path, map_location=None if not args.no_cuda else 'cpu')
+        # from collections import OrderedDict
+        # new_state_dict = OrderedDict()
+        # for k, v in checkpoint['state_dict'].items():
+        #     if 'module.' in k:
+        #         name = k[7:]
+        #     else:
+        #         name = k
+        #     new_state_dict[name] = v
         # model.load_state_dict(new_state_dict, strict=True)
 
     elif args.auto_continue:
@@ -522,7 +546,7 @@ def main(args):
             r, rs = validate(model, device, args, all_iters=all_iters, eval_num=1)
         else:
             r, rs = validate(model, device, args, all_iters=all_iters, eval_num=20)
-        if best_result < r:
+        if best_result <= r:
             early_stop = 0
             best_result = r
             best_results = rs
@@ -533,7 +557,11 @@ def main(args):
             for key in sorted(best_results.keys()):
                 log_info += 'final_{} = {:.6f}\t'.format(key, best_results[key])
             logger.info(log_info)
-        if early_stop >= 10:
+        
+        if all_iters <= args.alpha_ld_num:
+            early_stop = 0
+
+        if args.early_stop > 0 and early_stop >= args.early_stop:
             break
             
     return best_result, best_results
@@ -573,32 +601,46 @@ def train(model, device, args, *, val_interval, bn_process=False, all_iters=None
         # get_random_cand = lambda:tuple(np.random.randint(4) for i in range(4))
         
         t_outputs = t_model(**inputs)
+        t_output = t_outputs[1].detach()
+
         if args.finetune:
             inputs['architecture'] = args.arc
         else:
             arc = get_uniform_sample_cand(n_layer=args.n_layer, n_cell=args.n_cell, share_layer_arc=args.share_layer_arc)
             inputs['architecture'] = arc
 
-        output = model(**inputs)
+        inputs['layer_i'] = -3
+        inputs['bert_inputs'] = t_outputs[2]
+        t_output_transform = model(**inputs)
 
-        # print(inputs['labels'])
-        # preds = output.detach().cpu().numpy()
-        # preds = np.argmax(preds, axis=1)
-        # print(torch.from_numpy(preds))
-        # print(inputs['architecture'])
-        # print(inputs['architecture_mp'])
-        
-        # r_loss = loss_function(output, inputs['labels'])
-        # t_loss = cal_logit_loss(output, t_outputs[1].detach())
-        # loss = (1 - args.alpha_kd) * r_loss + args.alpha_kd * t_loss
-        loss = get_loss_func(args.alpha_kd, output, t_outputs[1].detach(), inputs['labels'])
+        if all_iters <= args.alpha_ld_num:
+            mul = 12 / args.n_layer
+            output = t_output
+            outputs = []
+            inputs['layer_i'] = -1
+            outputs.append(model(**inputs))
+            for i in range(args.n_layer):
+                t_idx = int(mul * i)
+                inputs['layer_i'] = i
+                inputs['bert_inputs'] = t_output_transform[t_idx]
+                outputs.append(model(**inputs))
+            layer_loss = get_layer_loss_func(t_output_transform, outputs, inputs['attention_mask'])
+            loss = layer_loss
+        else:
+            inputs['layer_i'] = -2
+            outputs = model(**inputs)
+            output = outputs[0]
+            loss = get_loss_func(args.alpha_kd, output, t_output, inputs['labels'])
+            layer_loss = get_layer_loss_func(t_output_transform, outputs[1:], inputs['attention_mask'], training=False)
+            loss += args.alpha_ld * layer_loss
+
         if args.n_gpu > 1:
-            r_loss = r_loss.mean()
-            t_loss = t_loss.mean()
+            # r_loss = r_loss.mean()
+            # t_loss = t_loss.mean()
             loss = loss.mean() # mean() to average on multi-gpu parallel training
         if args.gradient_accumulation_steps > 1:
-            r_loss = r_loss / args.gradient_accumulation_steps
-            t_loss = t_loss / args.gradient_accumulation_steps
+            # r_loss = r_loss / args.gradient_accumulation_steps
+            # t_loss = t_loss / args.gradient_accumulation_steps
             loss = loss / args.gradient_accumulation_steps
 
         loss.backward()
@@ -670,10 +712,9 @@ def validate(model, device, args, *, all_iters=None, eval_num=1):
                     inputs['architecture'] = args.arc
                 else:
                     inputs['architecture'] = arc
-                output = model(**inputs)
-
-                if isinstance(output, tuple):
-                    output = output[1]
+                
+                outputs = model(**inputs)
+                output = outputs[0]
 
                 eval_batch_num += 1
                 loss = loss_function(output, inputs['labels'])

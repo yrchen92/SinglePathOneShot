@@ -7,7 +7,7 @@ from blocks import *
 
 class ShuffleNetV2_OneShot(nn.Module):
 
-    def __init__(self, n_vocab, input_size=128, n_class=2, n_layer=4, n_cell=4, emb=None):
+    def __init__(self, n_vocab, input_size=128, n_class=2, n_layer=4, n_cell=4, dp=0.5, emb=None):
         super(ShuffleNetV2_OneShot, self).__init__()
         self.input_size = input_size
         self.n_layer = n_layer
@@ -25,13 +25,17 @@ class ShuffleNetV2_OneShot(nn.Module):
             self.token_type_embeddings = torch.nn.Embedding.from_pretrained(emb[2], freeze=False)
             emb_dim = emb[0].size(-1)
         self.embedding_transform = torch.nn.Linear(emb_dim, input_size)
-        self.embedding_layernorm = torch.nn.LayerNorm(input_size)
-        self.embedding_dropout = torch.nn.Dropout(0.5)
+        self.embedding_layernorm = torch.nn.LayerNorm(input_size, eps=1e-12)
+        self.embedding_dropout = torch.nn.Dropout(dp)
         self.features = torch.nn.ModuleList()
+        self.features_drop = torch.nn.ModuleList()
+        self.features_norm = torch.nn.ModuleList()
         archIndex = 0
         # layer
         for layer_i in range(self.n_layer):
             self.features.append(torch.nn.ModuleList())
+            self.features_drop.append(torch.nn.Dropout(dp))
+            self.features_norm.append(torch.nn.LayerNorm(input_size, eps=1e-12))
             layers = self.features[layer_i]
             for cell_i in range(self.n_cell):
                 layers.append(torch.nn.ModuleList())
@@ -48,22 +52,22 @@ class ShuffleNetV2_OneShot(nn.Module):
                             ops[-1].append(SkipOp())    
                         elif blockIndex == 2:
                             # print('Conv3')
-                            ops[-1].append(SimConv(input_size, input_size, 3))
+                            ops[-1].append(SVDSepConv(input_size, input_size, 3))
                         elif blockIndex == 3:
                             # print('Conv5')
-                            ops[-1].append(SimConv(input_size, input_size, 5))
+                            ops[-1].append(SVDSepConv(input_size, input_size, 5))
                         elif blockIndex == 4:
                             # print('Conv7')
-                            ops[-1].append(SimConv(input_size, input_size, 7))
+                            ops[-1].append(SVDSepConv(input_size, input_size, 7))
                         elif blockIndex == 5:
                             # print('linear')
-                            ops[-1].append(Linear(input_size, input_size))
+                            ops[-1].append(SVDLinear(input_size, input_size))
                         elif blockIndex == 6:
                             # print('SelfAttention 1')
-                            ops[-1].append(SelfAttention(input_size, 1))
+                            ops[-1].append(SVDSelfAttention(input_size, 1))
                         elif blockIndex == 7:
                             # print('SelfAttention 4')        
-                            ops[-1].append(SelfAttention(input_size, 4))
+                            ops[-1].append(SVDSelfAttention(input_size, 4))
                         elif blockIndex == 8:
                             # print('maxpooling')
                             ops[-1].append(MaxPooling())
@@ -72,15 +76,21 @@ class ShuffleNetV2_OneShot(nn.Module):
                             ops[-1].append(AvgPooling())
                         elif blockIndex == 10:
                             # print('RnnOp')
-                            ops[-1].append(RnnOp(input_size))
+                            ops[-1].append(LSTMOp(input_size))
                         else:
                             raise NotImplementedError
         self.archLen = archIndex
+        self.cellLen = self.archLen / self.n_layer
         self.g_pooling = GeneralizedPooler(input_size, input_size)
-        self.final_dropout = torch.nn.Dropout(0.5)
-        self.fc1 = nn.Linear(input_size, 512)
+        self.final_dropout = torch.nn.Dropout(dp)
+        self.fc1 = nn.Linear(input_size, 128)
         self.classifier = nn.Sequential(
-            nn.Linear(512, n_class))
+            nn.Linear(128, n_class))
+
+        self.bert_transform_layers = torch.nn.ModuleList()
+        for _ in range(13):
+            self.bert_transform_layers.append(nn.Linear(768, input_size))
+
         self._initialize_weights()
     
     def get_arc_parameters(self, architecture=None):
@@ -93,7 +103,7 @@ class ShuffleNetV2_OneShot(nn.Module):
             assert self.archLen == len(architecture), 'arclen:{}, arch:{}'.format(self.archLen, len(architecture))
             arc_i = 0
             for n, param in self.named_parameters():
-                if 'features' not in n:
+                if 'features' not in n and 'transform_layers' not in n:
                     num_params += param.numel()
             for layer_i in range(self.n_layer):
                 layers = self.features[layer_i]
@@ -117,13 +127,31 @@ class ShuffleNetV2_OneShot(nn.Module):
                 ops = layers[cell_i]
                 for op_i in range(cell_i+1):
                     op = ops[op_i][architecture[arc_i]]
-                    arc_str += '\n{}'.format(str(op))
+                    for n, _ in op.named_parameters():
+                        arc_str += '\n{}'.format(n)
                     arc_i += 1
         return arc_str
 
-
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
-                position_ids=None, head_mask=None, architecture=None):
+                position_ids=None, architecture=None, layer_i=-2, bert_inputs=None):
+        if layer_i == -3:
+            return self.forward_bert_transform(bert_inputs)
+        elif layer_i == -2:
+            return self.forward_net(input_ids, token_type_ids, attention_mask, labels, position_ids, architecture)
+        elif layer_i == -1:
+            return self.forward_embedding(input_ids, token_type_ids, attention_mask, position_ids)
+        else:
+            return self.forward_block(bert_inputs, attention_mask, architecture, layer_i)
+    
+    def forward_bert_transform(self, bert_inputs):
+        outputs = []
+        for i, input_id in enumerate(bert_inputs):
+            outputs.append(self.bert_transform_layers[i](input_id.detach()))
+        return outputs
+
+    def forward_net(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
+                position_ids=None, architecture=None):
+
         len_input = torch.sum(attention_mask, dim=-1)
         len_input_max = torch.max(len_input).item()
         input_ids = input_ids[:,:len_input_max]
@@ -141,11 +169,13 @@ class ShuffleNetV2_OneShot(nn.Module):
 
         x = self.word_embeddings(input_ids) + self.position_embeddings(position_ids) + self.token_type_embeddings(token_type_ids)
         x = self.embedding_transform(x)
-        x = self.embedding_layernorm(x)
         x = self.embedding_dropout(x)
+        x = self.embedding_layernorm(x)
         
         arc_i = 0
+        all_hidden_states = ()
         for layer_i in range(self.n_layer):
+            all_hidden_states = all_hidden_states + (x,)
             layers = self.features[layer_i]
             layers_outs = [x]
             for cell_i in range(self.n_cell):
@@ -155,20 +185,62 @@ class ShuffleNetV2_OneShot(nn.Module):
                     op = ops[op_i][architecture[arc_i]]
                     ops_outs.append(op(layers_outs[op_i], attention_mask))
                     arc_i += 1
-                layers_outs.append(sum(ops_outs)/len(ops_outs))
+                layers_outs.append(sum(ops_outs))
             x = layers_outs[-1]
-            
+            x = self.features_drop[layer_i](x)
+            x = self.features_norm[layer_i](x)
+
+        all_hidden_states = all_hidden_states + (x,)
+
         x = self.g_pooling(x, attention_mask)
-        # x = self.global_max_pool(x, attention_mask)
-        # x = torch.sum(x, dim=1)
-        # x = self.final_tanh(x)
         x = self.final_dropout(x)
         x = self.fc1(x)
         x = self.classifier(x)
+        outputs = (x,) + all_hidden_states
+
+        return outputs
+
+    def forward_embedding(self, input_ids, token_type_ids=None, attention_mask=None, position_ids=None):
+        len_input = torch.sum(attention_mask, dim=-1)
+        len_input_max = torch.max(len_input).item()
+        input_ids = input_ids[:,:len_input_max]
+        token_type_ids = token_type_ids[:,:len_input_max]
+        attention_mask = attention_mask[:,:len_input_max]
+
+        if position_ids is None:
+            seq_length = input_ids.size(1)
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+            position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        if token_type_ids is None:
+            token_type_ids = torch.zeros_like(input_ids)
+        
+        x = self.word_embeddings(input_ids) + self.position_embeddings(position_ids) + self.token_type_embeddings(token_type_ids)
+        x = self.embedding_transform(x)
+        x = self.embedding_dropout(x)
+        x = self.embedding_layernorm(x)
+
         return x
 
-
-
+    def forward_block(self, input_ids, attention_mask, architecture, layer_i):
+        x = input_ids
+        mask = attention_mask
+        arc_i = int(layer_i * self.cellLen)
+        attention_mask = mask[:,:x.size(1)]
+        layers = self.features[layer_i]
+        layers_outs = [x]
+        for cell_i in range(self.n_cell):
+            ops = layers[cell_i]
+            ops_outs = []
+            for op_i in range(cell_i + 1):
+                op = ops[op_i][architecture[arc_i]]
+                ops_outs.append(op(layers_outs[op_i], attention_mask))
+                arc_i += 1
+            layers_outs.append(sum(ops_outs))
+        x = layers_outs[-1]
+        x = self.features_drop[layer_i](x)
+        x = self.features_norm[layer_i](x)
+        return x
+            
     def global_max_pool(self, x, mask):
         # mask = torch.eq(mask.float(), 0.0).long()
         # mask = torch.unsqueeze(mask, dim=2).repeat(1, 1, x.size(2))

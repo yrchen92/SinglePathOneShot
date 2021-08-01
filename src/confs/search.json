@@ -7,21 +7,21 @@
     {
         "name": "alpha_kd",
         "type": "choice",
-        "values": [1.0, 0.5]
+        "values": [1.0]
     },
     {
         "name": "n_layer",
         "type": "choice",
-        "values": [2, 3, 4, 6]
+        "values": [1, 2, 3, 4]
     },
     {
         "name": "per_gpu_train_batch_size",
         "type": "choice",
-        "values": [128, 32]
+        "values": [128]
     },
     {
         "name": "hidden_size",
         "type": "choice",
-        "values": [128, 256, 512]
+        "values": [128]
     }
 ]
