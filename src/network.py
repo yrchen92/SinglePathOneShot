@@ -89,7 +89,7 @@ class ShuffleNetV2_OneShot(nn.Module):
 
         self.bert_transform_layers = torch.nn.ModuleList()
         for _ in range(13):
-            self.bert_transform_layers.append(nn.Linear(768, input_size))
+            self.bert_transform_layers.append(nn.Linear(input_size, 768))
 
         self._initialize_weights()
     
@@ -143,11 +143,11 @@ class ShuffleNetV2_OneShot(nn.Module):
         else:
             return self.forward_block(bert_inputs, attention_mask, architecture, layer_i)
     
-    def forward_bert_transform(self, bert_inputs):
-        outputs = []
-        for i, input_id in enumerate(bert_inputs):
-            outputs.append(self.bert_transform_layers[i](input_id.detach()))
-        return outputs
+    def forward_bert_transform(self, inputs):
+        bert_outputs = []
+        for i, input_id in enumerate(inputs):
+            bert_outputs.append(self.bert_transform_layers[i](input_id))
+        return bert_outputs
 
     def forward_net(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
                 position_ids=None, architecture=None):
@@ -196,9 +196,10 @@ class ShuffleNetV2_OneShot(nn.Module):
         x = self.final_dropout(x)
         x = self.fc1(x)
         x = self.classifier(x)
+        bert_outputs = self.forward_bert_transform(all_hidden_states)
         outputs = (x,) + all_hidden_states
 
-        return outputs
+        return outputs, bert_outputs
 
     def forward_embedding(self, input_ids, token_type_ids=None, attention_mask=None, position_ids=None):
         len_input = torch.sum(attention_mask, dim=-1)
